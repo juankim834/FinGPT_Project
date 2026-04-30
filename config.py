@@ -47,6 +47,10 @@ ALPACA_DEFAULT_LIMIT: int = 50
 
 FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
 FINNHUB_NEWS_URL: str = "https://finnhub.io/api/v1/company-news"
+FINNHUB_TIMEOUT_SEC: float = float(os.getenv("FINNHUB_TIMEOUT_SEC", "15"))
+FINNHUB_MAX_CALLS_PER_SEC: float = float(os.getenv("FINNHUB_MAX_CALLS_PER_SEC", "25"))
+FINNHUB_MAX_RETRIES: int = int(os.getenv("FINNHUB_MAX_RETRIES", "3"))
+FINNHUB_RETRY_BASE_DELAY_SEC: float = float(os.getenv("FINNHUB_RETRY_BASE_DELAY_SEC", "0.5"))
 
 # ---------------------------------------------------------------------------
 # Logging / output paths

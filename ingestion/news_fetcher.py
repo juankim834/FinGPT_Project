@@ -7,6 +7,7 @@ to Agent 1.
 """
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -18,13 +19,86 @@ from config import (
     ALPACA_DEFAULT_LIMIT,
     ALPACA_NEWS_URL,
     FINNHUB_API_KEY,
+    FINNHUB_MAX_CALLS_PER_SEC,
+    FINNHUB_MAX_RETRIES,
     FINNHUB_NEWS_URL,
+    FINNHUB_RETRY_BASE_DELAY_SEC,
+    FINNHUB_TIMEOUT_SEC,
     LOG_LEVEL,
     NEWS_PROVIDER,
 )
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+
+def _rate_limit_sleep(last_call_ts: float | None) -> float:
+    """
+    Sleep to maintain FINNHUB_MAX_CALLS_PER_SEC pacing.
+    Returns new timestamp after pacing.
+    """
+    if FINNHUB_MAX_CALLS_PER_SEC <= 0:
+        return time.monotonic()
+
+    min_interval = 1.0 / FINNHUB_MAX_CALLS_PER_SEC
+    now = time.monotonic()
+    if last_call_ts is not None:
+        elapsed = now - last_call_ts
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+    return time.monotonic()
+
+
+def _finnhub_get_with_retry(params: dict[str, Any], ticker: str) -> requests.Response:
+    """
+    Finnhub GET with retry/backoff on timeout/429/5xx.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, FINNHUB_MAX_RETRIES + 2):
+        try:
+            response = requests.get(FINNHUB_NEWS_URL, params=params, timeout=FINNHUB_TIMEOUT_SEC)
+
+            # Retry throttling/server errors with exponential backoff.
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                if attempt <= FINNHUB_MAX_RETRIES:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = max(float(retry_after), FINNHUB_RETRY_BASE_DELAY_SEC)
+                        except ValueError:
+                            delay = FINNHUB_RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1))
+                    else:
+                        delay = FINNHUB_RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Finnhub retry for %s (status=%d, attempt=%d, sleep=%.2fs)",
+                        ticker,
+                        response.status_code,
+                        attempt,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+            response.raise_for_status()
+            return response
+
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt <= FINNHUB_MAX_RETRIES:
+                delay = FINNHUB_RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1))
+                logger.warning(
+                    "Finnhub request failed for %s (attempt=%d): %s; retrying in %.2fs",
+                    ticker,
+                    attempt,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Unexpected Finnhub retry loop termination.")
 
 
 def _fetch_recent_articles_alpaca(
@@ -82,15 +156,16 @@ def _fetch_recent_articles_finnhub(
     from_date = to_date - timedelta(days=7)
 
     articles: list[dict[str, Any]] = []
+    last_call_ts: float | None = None
     for ticker in tickers:
+        last_call_ts = _rate_limit_sleep(last_call_ts)
         params: dict[str, Any] = {
             "symbol": ticker,
             "from": from_date.isoformat(),
             "to": to_date.isoformat(),
             "token": FINNHUB_API_KEY,
         }
-        response = requests.get(FINNHUB_NEWS_URL, params=params, timeout=15)
-        response.raise_for_status()
+        response = _finnhub_get_with_retry(params=params, ticker=ticker)
         raw_news: list[dict[str, Any]] = response.json()
 
         for item in raw_news:
