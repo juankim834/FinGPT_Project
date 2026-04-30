@@ -111,13 +111,10 @@ def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
     _ensure_chat_tokenizer()
     if _chat_tokenizer is not None and hasattr(_chat_tokenizer, "apply_chat_template"):
         try:
+            # Match evaluation behavior: single user message template path.
             if system_prompt.strip():
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ]
-            else:
-                messages = [{"role": "user", "content": user_content}]
+                user_content = f"{system_prompt}\n\n{user_content}"
+            messages = [{"role": "user", "content": user_content}]
             return _chat_tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -275,7 +272,7 @@ def _build_prompt(fingerprint: NewsFingerprint) -> str:
         f"{payload}\n"
     )
     # Match eval behavior: one user message, formatted by chat template.
-    return _format_chat_prompt("", f"{SYSTEM_PROMPT}\n\n{user_content}")
+    return _format_chat_prompt(SYSTEM_PROMPT, user_content)
 
 
 def _log_thinking(thinking_text: str, ticker: str) -> None:
@@ -326,7 +323,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
         from vllm import SamplingParams  # type: ignore
 
         prompt = _build_prompt(fingerprint)
-        token_budgets = [768, 1024]
+        token_budgets = [1024, 1536]
         parsed: dict[str, Any] | None = None
         last_parse_error: Exception | None = None
 
@@ -334,6 +331,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
             params = SamplingParams(
                 max_tokens=token_budget,
                 temperature=0.0,
+                top_p=1.0,
             )
             outputs = _vllm_engine.generate([prompt], params)
             raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
