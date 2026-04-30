@@ -32,6 +32,7 @@ _DIAG_MD_DIR_ENV = "FINGPT_DIAG_MD_DIR"
 _SPECIAL_TOKEN_RE = re.compile(
     r"(<\|[^>]+\|>|<｜[^｜]+｜>|<s>|</s>|\[INST\]|\[/INST\])"
 )
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 
 _vllm_engine = None
 _chat_tokenizer = None
@@ -136,9 +137,18 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _normalize_generated_text(text: str) -> str:
-    cleaned = _SPECIAL_TOKEN_RE.sub(" ", text)
+    # Decode common tokenized artifacts seen in debug outputs.
+    cleaned = text.replace("Ġ", " ").replace("Ċ", "\n")
+    cleaned = _SPECIAL_TOKEN_RE.sub(" ", cleaned)
+    cleaned = _THINK_TAG_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+    # Keep only structured signal section if chain-of-thought leaks ahead of it.
+    marker_match = re.search(r"(?im)^###\s*signal\b", cleaned)
+    if marker_match:
+        cleaned = cleaned[marker_match.start():].strip()
+    return cleaned
 
 
 def _extract_json_blob(text: str) -> str:
@@ -201,37 +211,52 @@ def _parse_markdown_signal(raw_text: str) -> dict[str, Any]:
         "cot": "",
     }
 
+    def _extract_value(line_text: str) -> str:
+        normalized = line_text.replace("**", "")
+        if normalized.startswith("-"):
+            normalized = normalized[1:].strip()
+        return normalized.split(":", 1)[1].strip() if ":" in normalized else ""
+
     cot_started = False
     for line in lines:
         lower = line.lower()
         if lower.startswith("### "):
             continue
-        if lower.startswith("- ticker:"):
-            result["ticker"] = line.split(":", 1)[1].strip()
+        normalized = line.replace("**", "").strip()
+        if normalized.startswith("-"):
+            normalized = normalized[1:].strip()
+        normalized_lower = normalized.lower()
+
+        if normalized_lower.startswith("ticker:"):
+            result["ticker"] = _extract_value(line)
             cot_started = False
             continue
-        if lower.startswith("- direction:"):
-            result["direction"] = line.split(":", 1)[1].strip().lower()
+        if normalized_lower.startswith("direction:"):
+            result["direction"] = _extract_value(line).lower()
             cot_started = False
             continue
-        if lower.startswith("- strategy_tag:"):
-            result["strategy_tag"] = line.split(":", 1)[1].strip().lower()
+        if normalized_lower.startswith("strategy_tag:"):
+            result["strategy_tag"] = _extract_value(line).lower()
             cot_started = False
             continue
-        if lower.startswith("- confidence:"):
-            raw_conf = line.split(":", 1)[1].strip()
+        if normalized_lower.startswith("confidence:"):
+            raw_conf = _extract_value(line)
+            raw_conf = raw_conf.replace("%", "").strip()
             try:
-                result["confidence"] = float(raw_conf)
+                conf = float(raw_conf)
+                if conf > 1.0:
+                    conf = conf / 100.0
+                result["confidence"] = conf
             except ValueError:
                 # Keep default and let schema validation catch if needed.
                 pass
             cot_started = False
             continue
-        if lower.startswith("- cot:"):
-            result["cot"] = line.split(":", 1)[1].strip()
+        if normalized_lower.startswith("cot:"):
+            result["cot"] = _extract_value(line)
             cot_started = True
             continue
-        if cot_started and not lower.startswith("- "):
+        if cot_started and not normalized_lower.startswith(("ticker:", "direction:", "strategy_tag:", "confidence:")):
             # Allow wrapped reasoning lines after `- cot:`.
             result["cot"] = f"{result['cot']} {line}".strip()
 
