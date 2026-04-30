@@ -31,14 +31,34 @@ _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 _DIAG_MD_DIR_ENV = "FINGPT_DIAG_MD_DIR"
 
 _vllm_engine = None
+_chat_tokenizer = None
+
+
+def _ensure_chat_tokenizer() -> None:
+    global _chat_tokenizer  # noqa: PLW0603
+    if _chat_tokenizer is not None:
+        return
+    if not FINGPT_MODEL_PATH:
+        return
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+
+        _chat_tokenizer = AutoTokenizer.from_pretrained(
+            FINGPT_MODEL_PATH,
+            trust_remote_code=True,
+        )
+    except Exception as exc:
+        logger.warning("Failed to initialize chat tokenizer: %s", exc)
 
 
 def _load_model() -> None:
     """Lazy-load a vLLM engine once; reuse Agent 1 engine in shared mode."""
-    global _vllm_engine  # noqa: PLW0603
+    global _vllm_engine, _chat_tokenizer  # noqa: PLW0603
 
-    if _vllm_engine is not None:
+    if _vllm_engine is not None and _chat_tokenizer is not None:
         return
+
+    _ensure_chat_tokenizer()
 
     if SHARE_SINGLE_LLM_BETWEEN_AGENTS:
         from agent1.extractor import get_shared_vllm_engine
@@ -61,6 +81,7 @@ def _load_model() -> None:
     from vllm import LLM  # type: ignore
 
     logger.info("Loading Agent 2 vLLM engine from: %s", FINGPT_MODEL_PATH)
+    _ensure_chat_tokenizer()
     _vllm_engine = LLM(
         model=FINGPT_MODEL_PATH,
         trust_remote_code=True,
@@ -76,7 +97,33 @@ def set_shared_vllm_engine(engine) -> None:
     """Inject a preloaded vLLM engine for Agent 2 reuse."""
     global _vllm_engine  # noqa: PLW0603
     _vllm_engine = engine
+    _ensure_chat_tokenizer()
     logger.info("Injected shared vLLM engine into Agent 2 reasoner.")
+
+
+def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
+    """
+    Format prompt using tokenizer chat template (preferred), with fallback.
+    """
+    _ensure_chat_tokenizer()
+    if _chat_tokenizer is not None and hasattr(_chat_tokenizer, "apply_chat_template"):
+        try:
+            return _chat_tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception as exc:
+            logger.warning("apply_chat_template failed, using fallback prompt: %s", exc)
+
+    return (
+        f"<|system|>\n{system_prompt}\n"
+        f"<|user|>\n{user_content}\n"
+        "<|assistant|>\n"
+    )
 
 
 def _strip_code_fences(text: str) -> str:
@@ -209,14 +256,12 @@ def _build_prompt(fingerprint: NewsFingerprint) -> str:
         "Based on this and the extracted facts, determine the trading signal."
     )
 
-    return (
-        f"<|system|>\n{SYSTEM_PROMPT}\n"
-        "<|user|>\n"
+    user_content = (
         f"{sentiment_line}\n\n"
         "NewsFingerprint JSON:\n"
         f"{payload}\n"
-        "<|assistant|>\n"
     )
+    return _format_chat_prompt(SYSTEM_PROMPT, user_content)
 
 
 def _log_thinking(thinking_text: str, ticker: str) -> None:
