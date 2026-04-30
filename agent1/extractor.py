@@ -7,7 +7,10 @@ API: extract_fingerprint(article_text) -> Optional[NewsFingerprint].
 
 import json
 import logging
+import os
 import re
+from datetime import datetime, timezone
+from hashlib import md5
 from typing import Any, Optional
 
 from config import (
@@ -39,6 +42,7 @@ _SENTIMENT_VALUES: dict[SentimentLabel, int] = {
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+_DIAG_MD_DIR_ENV = "FINGPT_DIAG_MD_DIR"
 
 _vllm_engine = None
 
@@ -228,6 +232,32 @@ def _generate_extraction_text(prompt: str, max_tokens: int) -> str:
     return outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
 
 
+def _save_md_debug_output(
+    article_text: str,
+    raw_output: str,
+    attempt_idx: int,
+    token_budget: int,
+) -> None:
+    """
+    Persist raw extraction output for debugging in markdown files.
+    """
+    try:
+        base_dir = os.getenv(_DIAG_MD_DIR_ENV, "output/diagnostics_md")
+        out_dir = os.path.join(base_dir, "agent1")
+        os.makedirs(out_dir, exist_ok=True)
+
+        article_id = md5(article_text.encode("utf-8")).hexdigest()[:12]
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"{timestamp}_a1_{article_id}_attempt{attempt_idx}_tok{token_budget}.md"
+        out_path = os.path.join(out_dir, filename)
+
+        with open(out_path, "w", encoding="utf-8") as handle:
+            handle.write(raw_output)
+        logger.info("Saved Agent 1 markdown debug output to %s", out_path)
+    except Exception as exc:
+        logger.warning("Failed to save Agent 1 markdown debug output: %s", exc)
+
+
 def _build_extraction_prompt(article_text: str) -> str:
     return (
         f"<|system|>\n{AGENT1_SYSTEM_PROMPT}\n"
@@ -297,6 +327,7 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
 
         for attempt_idx, token_budget in enumerate(token_budgets, start=1):
             raw_output = _generate_extraction_text(prompt, max_tokens=token_budget)
+            _save_md_debug_output(article_text, raw_output, attempt_idx, token_budget)
             logger.info(
                 "FinGPT raw extraction output (attempt %d, max_tokens=%d): %s",
                 attempt_idx,

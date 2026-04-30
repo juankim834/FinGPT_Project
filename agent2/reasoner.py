@@ -10,7 +10,8 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from hashlib import md5
+from typing import Any, Optional
 
 from config import (
     FINGPT_MODEL_PATH,
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+_DIAG_MD_DIR_ENV = "FINGPT_DIAG_MD_DIR"
 
 _vllm_engine = None
 
@@ -88,6 +90,107 @@ def _extract_json_blob(text: str) -> str:
     return match.group(0).strip() if match else cleaned
 
 
+def _extract_balanced_json_blob(text: str) -> str:
+    cleaned = _strip_code_fences(text)
+    start = cleaned.find("{")
+    if start < 0:
+        return ""
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(cleaned)):
+        ch = cleaned[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start : i + 1].strip()
+    return ""
+
+
+def _parse_json_signal(raw_text: str) -> dict[str, Any]:
+    primary = _extract_json_blob(raw_text)
+    try:
+        return json.loads(primary)
+    except json.JSONDecodeError:
+        balanced = _extract_balanced_json_blob(raw_text)
+        if balanced:
+            return json.loads(balanced)
+        raise
+
+
+def _parse_markdown_signal(raw_text: str) -> dict[str, Any]:
+    text = _strip_code_fences(raw_text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    result: dict[str, Any] = {
+        "ticker": "",
+        "direction": "neutral",
+        "strategy_tag": "none",
+        "confidence": 0.0,
+        "cot": "",
+    }
+
+    cot_started = False
+    for line in lines:
+        lower = line.lower()
+        if lower.startswith("### "):
+            continue
+        if lower.startswith("- ticker:"):
+            result["ticker"] = line.split(":", 1)[1].strip()
+            cot_started = False
+            continue
+        if lower.startswith("- direction:"):
+            result["direction"] = line.split(":", 1)[1].strip().lower()
+            cot_started = False
+            continue
+        if lower.startswith("- strategy_tag:"):
+            result["strategy_tag"] = line.split(":", 1)[1].strip().lower()
+            cot_started = False
+            continue
+        if lower.startswith("- confidence:"):
+            raw_conf = line.split(":", 1)[1].strip()
+            try:
+                result["confidence"] = float(raw_conf)
+            except ValueError:
+                # Keep default and let schema validation catch if needed.
+                pass
+            cot_started = False
+            continue
+        if lower.startswith("- cot:"):
+            result["cot"] = line.split(":", 1)[1].strip()
+            cot_started = True
+            continue
+        if cot_started and not lower.startswith("- "):
+            # Allow wrapped reasoning lines after `- cot:`.
+            result["cot"] = f"{result['cot']} {line}".strip()
+
+    return result
+
+
+def _parse_signal_structured(raw_text: str) -> dict[str, Any]:
+    try:
+        return _parse_json_signal(raw_text)
+    except Exception:
+        parsed = _parse_markdown_signal(raw_text)
+        if parsed.get("ticker") and parsed.get("cot"):
+            return parsed
+        raise
+
+
 def _build_prompt(fingerprint: NewsFingerprint) -> str:
     payload = json.dumps(
         {
@@ -126,6 +229,33 @@ def _log_thinking(thinking_text: str, ticker: str) -> None:
     logger.info("Reasoning text saved to %s", filename)
 
 
+def _save_md_debug_output(
+    fingerprint: NewsFingerprint,
+    raw_output: str,
+    attempt_idx: int,
+    token_budget: int,
+) -> None:
+    """
+    Persist raw signal-generation output for debugging in markdown files.
+    """
+    try:
+        base_dir = os.getenv(_DIAG_MD_DIR_ENV, "output/diagnostics_md")
+        out_dir = os.path.join(base_dir, "agent2")
+        os.makedirs(out_dir, exist_ok=True)
+
+        identity = f"{fingerprint.headline}|{fingerprint.companies_named[0] if fingerprint.companies_named else ''}"
+        fp_id = md5(identity.encode("utf-8")).hexdigest()[:12]
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"{timestamp}_a2_{fp_id}_attempt{attempt_idx}_tok{token_budget}.md"
+        out_path = os.path.join(out_dir, filename)
+
+        with open(out_path, "w", encoding="utf-8") as handle:
+            handle.write(raw_output)
+        logger.info("Saved Agent 2 markdown debug output to %s", out_path)
+    except Exception as exc:
+        logger.warning("Failed to save Agent 2 markdown debug output: %s", exc)
+
+
 def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
     """
     Run vLLM inference to generate and validate a TradingSignal.
@@ -137,15 +267,39 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
         from vllm import SamplingParams  # type: ignore
 
         prompt = _build_prompt(fingerprint)
-        params = SamplingParams(
-            max_tokens=768,
-            temperature=0.0,
-        )
-        outputs = _vllm_engine.generate([prompt], params)
-        raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
-        logger.info("Agent 2 raw output: %s", raw_text[:300])
+        token_budgets = [768, 1024]
+        parsed: dict[str, Any] | None = None
+        last_parse_error: Exception | None = None
 
-        parsed = json.loads(_extract_json_blob(raw_text))
+        for attempt_idx, token_budget in enumerate(token_budgets, start=1):
+            params = SamplingParams(
+                max_tokens=token_budget,
+                temperature=0.0,
+            )
+            outputs = _vllm_engine.generate([prompt], params)
+            raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
+            _save_md_debug_output(fingerprint, raw_text, attempt_idx, token_budget)
+            logger.info(
+                "Agent 2 raw output (attempt %d, max_tokens=%d): %s",
+                attempt_idx,
+                token_budget,
+                raw_text[:300],
+            )
+            try:
+                parsed = _parse_signal_structured(raw_text)
+                break
+            except Exception as exc:
+                last_parse_error = exc
+                logger.warning(
+                    "Agent 2 parse failed (attempt %d, max_tokens=%d): %s",
+                    attempt_idx,
+                    token_budget,
+                    exc,
+                )
+
+        if parsed is None:
+            raise RuntimeError("Agent 2 failed to produce valid structured output.") from last_parse_error
+
         signal = TradingSignal(**parsed)
 
         reasoning_text = parsed.get("cot", "").strip() if isinstance(parsed, dict) else ""
