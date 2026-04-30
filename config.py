@@ -36,12 +36,17 @@ CLAUDE_MAX_TOKENS: int = 16_000   # must be > thinking budget
 CLAUDE_THINKING_BUDGET: int = 8_000
 
 # ---------------------------------------------------------------------------
-# Alpaca News API
+# News API providers
 # ---------------------------------------------------------------------------
+NEWS_PROVIDER: str = os.getenv("NEWS_PROVIDER", "alpaca").strip().lower()
+
 ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "")
 ALPACA_API_SECRET: str = os.getenv("ALPACA_API_SECRET", "")
 ALPACA_NEWS_URL: str = "https://data.alpaca.markets/v1beta1/news"
 ALPACA_DEFAULT_LIMIT: int = 50
+
+FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
+FINNHUB_NEWS_URL: str = "https://finnhub.io/api/v1/company-news"
 
 # ---------------------------------------------------------------------------
 # Logging / output paths
