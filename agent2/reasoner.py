@@ -444,7 +444,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
         prompt = _build_prompt(fingerprint)
         signal_schema = TradingSignal.model_json_schema()
         params_kwargs: dict[str, Any] = {
-            "max_tokens": 256,
+            "max_tokens": 1024,
             "temperature": 0.0,
             "top_p": 1.0,
         }
