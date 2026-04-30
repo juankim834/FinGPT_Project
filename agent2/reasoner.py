@@ -60,7 +60,8 @@ def _load_model() -> None:
     """Lazy-load a vLLM engine once; reuse Agent 1 engine in shared mode."""
     global _vllm_engine, _chat_tokenizer  # noqa: PLW0603
 
-    if _vllm_engine is not None and _chat_tokenizer is not None:
+    if _vllm_engine is not None:
+        _ensure_chat_tokenizer()
         return
 
     _ensure_chat_tokenizer()
