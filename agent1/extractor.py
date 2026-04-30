@@ -403,19 +403,34 @@ def _normalize_sentiment_label(raw_text: str) -> SentimentLabel:
 
 
 def _score_sentiment(article_text: str) -> dict[str, Any]:
-    """
-    Classify sentiment using deterministic vLLM decoding over fixed labels.
-    """
-    from vllm import SamplingParams  # type: ignore
+    from vllm import SamplingParams
+    from vllm.sampling_params import GuidedDecodingParams
 
     prompt = _build_sentiment_prompt(article_text)
-    params = SamplingParams(max_tokens=6, temperature=0.0)
+
+    # Constrain output to exactly one of the 5 labels
+    label_schema = {"type": "string", "enum": list(_SENTIMENT_LABELS)}
+    params = SamplingParams(
+        max_tokens=16,           # enough for longest label after think block
+        temperature=0.0,
+        logprobs=len(_SENTIMENT_LABELS),   # get token-level logprobs for confidence
+        guided_decoding=GuidedDecodingParams(json=label_schema),
+    )
     outputs = _vllm_engine.generate([prompt], params)
     raw = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
 
     sentiment_label = _normalize_sentiment_label(raw)
     sentiment_score = float(_SENTIMENT_VALUES[sentiment_label])
-    sentiment_confidence = 1.0
+
+    # Derive confidence from top logprob of first generated token
+    token_logprobs = outputs[0].outputs[0].logprobs
+    if token_logprobs:
+        import math
+        top_logprob = max(token_logprobs[0].values(), key=lambda x: x.logprob).logprob
+        sentiment_confidence = round(math.exp(top_logprob), 4)
+    else:
+        sentiment_confidence = 1.0   # fallback only if logprobs unavailable
+
     sentiment_logits = {
         label: (1.0 if label == sentiment_label else 0.0) for label in _SENTIMENT_LABELS
     }
