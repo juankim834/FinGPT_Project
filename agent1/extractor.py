@@ -7,6 +7,7 @@ API: extract_fingerprint(article_text) -> Optional[NewsFingerprint].
 
 import json
 import logging
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -48,6 +49,25 @@ _THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 
 _vllm_engine = None
 _chat_tokenizer = None
+
+
+def _import_structured_output_params():
+    """
+    Import the structured output / guided decoding params class,
+    handling both the new API (vLLM >= 0.12.0) and the old API.
+    Returns the class or None if unavailable.
+    """
+    try:
+        from vllm.sampling_params import StructuredOutputParams  # type: ignore
+        return StructuredOutputParams
+    except ImportError:
+        pass
+    try:
+        from vllm.sampling_params import GuidedDecodingParams  # type: ignore
+        return GuidedDecodingParams
+    except ImportError:
+        pass
+    return None
 
 
 def _ensure_chat_tokenizer() -> None:
@@ -131,7 +151,6 @@ def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
                     {"role": "user", "content": user_content},
                 ]
             else:
-                # Match eval behavior for this model family.
                 messages = [{"role": "user", "content": user_content}]
             return _chat_tokenizer.apply_chat_template(
                 messages,
@@ -154,14 +173,12 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _normalize_generated_text(text: str) -> str:
-    # Decode common tokenized artifacts seen in debug outputs.
     cleaned = text.replace("Ġ", " ").replace("Ċ", "\n")
     cleaned = _SPECIAL_TOKEN_RE.sub(" ", cleaned)
     cleaned = _THINK_TAG_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
-    # Keep only structured section if chain-of-thought leaks ahead of it.
     marker_match = re.search(r"(?im)^###\s*facts\b", cleaned)
     if marker_match:
         cleaned = cleaned[marker_match.start():].strip()
@@ -175,10 +192,6 @@ def _extract_json_blob(text: str) -> str:
 
 
 def _extract_balanced_json_blob(text: str) -> str:
-    """
-    Extract first balanced JSON object from text with string-aware brace matching.
-    Returns empty string if no balanced object is found.
-    """
     cleaned = _strip_code_fences(text)
     start = cleaned.find("{")
     if start < 0:
@@ -210,9 +223,6 @@ def _extract_balanced_json_blob(text: str) -> str:
 
 
 def _parse_extracted_json(raw_output: str) -> dict[str, Any]:
-    """
-    Parse extraction JSON robustly from model output.
-    """
     primary = _extract_json_blob(raw_output)
     try:
         return json.loads(primary)
@@ -224,9 +234,6 @@ def _parse_extracted_json(raw_output: str) -> dict[str, Any]:
 
 
 def _parse_markdown_extraction(raw_output: str) -> dict[str, Any]:
-    """
-    Parse Agent 1 markdown contract into JSON-like dict.
-    """
     text = _strip_code_fences(raw_output)
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
 
@@ -301,9 +308,8 @@ def _parse_markdown_extraction(raw_output: str) -> dict[str, Any]:
 
 
 def _parse_extraction_structured(raw_output: str) -> dict[str, Any]:
-    """
-    Parse model output that may be JSON or markdown.
-    """
+    if not raw_output.strip():
+        raise ValueError("Model returned empty output after normalization")
     try:
         return _parse_extracted_json(raw_output)
     except Exception:
@@ -336,13 +342,12 @@ def _generate_extraction_text(
         "temperature": 0.0,
     }
     if guided_schema is not None:
-        try:
-            from vllm.sampling_params import GuidedDecodingParams  # type: ignore
-
-            params_kwargs["guided_decoding"] = GuidedDecodingParams(json=guided_schema)
-        except ImportError:
+        StructuredOutputParams = _import_structured_output_params()
+        if StructuredOutputParams is not None:
+            params_kwargs["guided_decoding"] = StructuredOutputParams(json=guided_schema)
+        else:
             logger.warning(
-                "Guided decoding unavailable in current vLLM version; "
+                "Structured output params unavailable in current vLLM version; "
                 "falling back to non-guided extraction."
             )
     params = SamplingParams(**params_kwargs)
@@ -356,9 +361,6 @@ def _save_md_debug_output(
     attempt_idx: int,
     token_budget: int,
 ) -> None:
-    """
-    Persist raw extraction output for debugging in markdown files.
-    """
     try:
         base_dir = os.getenv(_DIAG_MD_DIR_ENV, "output/diagnostics_md")
         out_dir = os.path.join(base_dir, "agent1")
@@ -377,7 +379,6 @@ def _save_md_debug_output(
 
 
 def _build_extraction_prompt(article_text: str) -> str:
-    # Match evaluation path: one user message via chat template.
     user_content = f"{AGENT1_SYSTEM_PROMPT}\n\nArticle:\n{article_text}"
     return _format_chat_prompt("", user_content)
 
@@ -398,38 +399,44 @@ def _normalize_sentiment_label(raw_text: str) -> SentimentLabel:
     for label in _SENTIMENT_LABELS:
         if label in text:
             return label
-    # Deterministic fallback if model returns unexpected wording.
     return "neutral"
 
 
 def _score_sentiment(article_text: str) -> dict[str, Any]:
-    from vllm import SamplingParams
-    from vllm.sampling_params import GuidedDecodingParams
+    from vllm import SamplingParams  # type: ignore
 
     prompt = _build_sentiment_prompt(article_text)
-
-    # Constrain output to exactly one of the 5 labels
     label_schema = {"type": "string", "enum": list(_SENTIMENT_LABELS)}
-    params = SamplingParams(
-        max_tokens=16,           # enough for longest label after think block
-        temperature=0.0,
-        logprobs=len(_SENTIMENT_LABELS),   # get token-level logprobs for confidence
-        guided_decoding=GuidedDecodingParams(json=label_schema),
-    )
+
+    params_kwargs: dict[str, Any] = {
+        "max_tokens": 32,
+        "temperature": 0.0,
+        "logprobs": len(_SENTIMENT_LABELS),
+    }
+    structured_available = False
+    StructuredOutputParams = _import_structured_output_params()
+    if StructuredOutputParams is not None:
+        params_kwargs["guided_decoding"] = StructuredOutputParams(json=label_schema)
+        structured_available = True
+    else:
+        logger.warning(
+            "Structured output params unavailable in current vLLM version; "
+            "falling back to plain sentiment inference."
+        )
+
+    params = SamplingParams(**params_kwargs)
     outputs = _vllm_engine.generate([prompt], params)
     raw = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
 
     sentiment_label = _normalize_sentiment_label(raw)
     sentiment_score = float(_SENTIMENT_VALUES[sentiment_label])
 
-    # Derive confidence from top logprob of first generated token
     token_logprobs = outputs[0].outputs[0].logprobs
-    if token_logprobs:
-        import math
+    if token_logprobs and structured_available:
         top_logprob = max(token_logprobs[0].values(), key=lambda x: x.logprob).logprob
         sentiment_confidence = round(math.exp(top_logprob), 4)
     else:
-        sentiment_confidence = 1.0   # fallback only if logprobs unavailable
+        sentiment_confidence = 1.0
 
     sentiment_logits = {
         label: (1.0 if label == sentiment_label else 0.0) for label in _SENTIMENT_LABELS
@@ -454,7 +461,7 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
 
         prompt = _build_extraction_prompt(article_text)
         guided_schema = _build_guided_extraction_schema()
-        token_budget = 512
+        token_budget = 768
         raw_output = _generate_extraction_text(
             prompt,
             max_tokens=token_budget,
