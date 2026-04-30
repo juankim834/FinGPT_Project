@@ -8,3 +8,6 @@ torch>=2.2.0
 pytest>=8.0.0
 pandas>=2.0.0
 notebook>=7.0.0
+yfinance>=0.2.0
+pyarrow
+datasets

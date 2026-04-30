@@ -1,3 +1,4 @@
+# Required change: switched guided decoding import to StructuredOutputParams for vLLM >= 0.12.0.
 """
 agent2/reasoner.py — Agent 2 vLLM reasoner.
 
@@ -447,12 +448,12 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
             "top_p": 1.0,
         }
         try:
-            from vllm.sampling_params import GuidedDecodingParams  # type: ignore
+            from vllm.sampling_params import StructuredOutputParams  # type: ignore
 
-            params_kwargs["guided_decoding"] = GuidedDecodingParams(json=signal_schema)
+            params_kwargs["guided_decoding"] = StructuredOutputParams(json=signal_schema)
         except ImportError:
             logger.warning(
-                "Guided decoding unavailable in current vLLM version; "
+                "Structured output params unavailable in current vLLM version; "
                 "falling back to non-guided signal generation."
             )
 

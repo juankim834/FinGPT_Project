@@ -1,3 +1,4 @@
+# Required change: removed GuidedDecodingParams fallback and use StructuredOutputParams only.
 """
 agent1/extractor.py — Agent 1: FinGPT fact + sentiment extractor.
 
@@ -53,20 +54,14 @@ _chat_tokenizer = None
 
 def _import_structured_output_params():
     """
-    Import the structured output / guided decoding params class,
-    handling both the new API (vLLM >= 0.12.0) and the old API.
+    Import structured output params class (vLLM >= 0.12.0).
     Returns the class or None if unavailable.
     """
     try:
         from vllm.sampling_params import StructuredOutputParams  # type: ignore
         return StructuredOutputParams
     except ImportError:
-        pass
-    try:
-        from vllm.sampling_params import GuidedDecodingParams  # type: ignore
-        return GuidedDecodingParams
-    except ImportError:
-        pass
+        logger.warning("StructuredOutputParams not available in current vLLM version.")
     return None
 
 

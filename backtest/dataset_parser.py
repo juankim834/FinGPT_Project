@@ -1,0 +1,120 @@
+"""
+Dataset parsing utilities for FinGPT backtesting.
+"""
+
+from __future__ import annotations
+
+import re
+
+import pandas as pd
+
+_INST_TAG_RE = re.compile(r"\[/?INST\]|<<SYS>>|<</SYS>>", re.IGNORECASE)
+_DATE_RANGE_RE = re.compile(
+    r"From\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+
+
+def load_dataset(path: str) -> pd.DataFrame:
+    """
+    Load dataset from a local parquet or CSV file.
+    Returns a DataFrame with normalized columns: input, output, answer, ticker.
+    """
+    lower = path.lower()
+    if lower.endswith(".parquet"):
+        df = pd.read_parquet(path)
+    elif lower.endswith(".csv"):
+        df = pd.read_csv(path)
+    else:
+        raise ValueError("Unsupported dataset format. Use .parquet or .csv")
+
+    # Normalize common naming variants to required names.
+    normalized_columns = {col: col.strip().lower() for col in df.columns}
+    df = df.rename(columns=normalized_columns)
+    column_aliases = {
+        "input_text": "input",
+        "prompt": "input",
+        "response": "output",
+        "label": "answer",
+        "symbol": "ticker",
+    }
+    df = df.rename(columns=column_aliases)
+
+    required = ["input", "output", "answer", "ticker"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df[required].copy()
+
+
+def extract_article_text(input_prompt: str) -> str:
+    """
+    Extract headline/news section from raw [INST] prompt content.
+    """
+    text = input_prompt or ""
+    text = _INST_TAG_RE.sub(" ", text)
+    text = text.strip()
+
+    start_idx = text.find("[Headline]:")
+    if start_idx < 0:
+        return ""
+
+    end_idx = text.find("[Basic Financials]:", start_idx)
+    if end_idx < 0:
+        end_idx = len(text)
+
+    news_block = text[start_idx:end_idx]
+    news_block = re.sub(r"\[(Headline|Summary)\]:", " ", news_block, flags=re.IGNORECASE)
+    news_block = re.sub(r"\s+", " ", news_block).strip()
+    return news_block
+
+
+def extract_date_range(input_prompt: str) -> tuple[str, str]:
+    """
+    Parse `From YYYY-MM-DD to YYYY-MM-DD` from prompt text.
+    """
+    match = _DATE_RANGE_RE.search(input_prompt or "")
+    if not match:
+        return "", ""
+    return match.group(1), match.group(2)
+
+
+def parse_fingpt_label(answer: str) -> str:
+    """
+    Normalize FinGPT answer label to up/down/neutral.
+    """
+    normalized = (answer or "").strip().lower()
+    if "up" in normalized:
+        return "up"
+    if "down" in normalized:
+        return "down"
+    return "neutral"
+
+
+def build_backtest_rows(df: pd.DataFrame) -> list[dict]:
+    """
+    Convert dataset rows into normalized backtest rows.
+    """
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        raw_input = str(row.get("input", "") or "")
+        ticker = str(row.get("ticker", "") or "").strip().upper()
+        article_text = extract_article_text(raw_input)
+        if not ticker or not article_text:
+            continue
+
+        start_date, end_date = extract_date_range(raw_input)
+        fingpt_label = parse_fingpt_label(str(row.get("answer", "") or ""))
+
+        rows.append(
+            {
+                "ticker": ticker,
+                "start_date": start_date,
+                "end_date": end_date,
+                "article_text": article_text,
+                "fingpt_label": fingpt_label,
+            }
+        )
+    return rows
+
