@@ -43,6 +43,10 @@ _SENTIMENT_VALUES: dict[SentimentLabel, int] = {
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 _DIAG_MD_DIR_ENV = "FINGPT_DIAG_MD_DIR"
+_SPECIAL_TOKEN_RE = re.compile(
+    r"(<\|[^>]+\|>|<｜[^｜]+｜>|<s>|</s>|\[INST\]|\[/INST\])"
+)
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 
 _vllm_engine = None
 _chat_tokenizer = None
@@ -123,11 +127,16 @@ def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
     _ensure_chat_tokenizer()
     if _chat_tokenizer is not None and hasattr(_chat_tokenizer, "apply_chat_template"):
         try:
-            return _chat_tokenizer.apply_chat_template(
-                [
+            if system_prompt.strip():
+                messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
-                ],
+                ]
+            else:
+                # Match eval behavior for this model family.
+                messages = [{"role": "user", "content": user_content}]
+            return _chat_tokenizer.apply_chat_template(
+                messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -144,6 +153,21 @@ def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
 def _strip_code_fences(text: str) -> str:
     match = _CODE_FENCE_RE.search(text)
     return match.group(1).strip() if match else text.strip()
+
+
+def _normalize_generated_text(text: str) -> str:
+    # Decode common tokenized artifacts seen in debug outputs.
+    cleaned = text.replace("Ġ", " ").replace("Ċ", "\n")
+    cleaned = _SPECIAL_TOKEN_RE.sub(" ", cleaned)
+    cleaned = _THINK_TAG_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+    # Keep only structured section if chain-of-thought leaks ahead of it.
+    marker_match = re.search(r"(?im)^###\s*facts\b", cleaned)
+    if marker_match:
+        cleaned = cleaned[marker_match.start():].strip()
+    return cleaned
 
 
 def _extract_json_blob(text: str) -> str:
@@ -216,6 +240,21 @@ def _parse_markdown_extraction(raw_output: str) -> dict[str, Any]:
         "event_keywords": [],
     }
 
+    def _add_list_items(field: str, raw: str) -> None:
+        item = raw.strip().strip("-").strip()
+        if not item:
+            return
+        item = item.replace("**", "").strip()
+        if item.lower() == "none":
+            return
+        if "," in item:
+            for part in item.split(","):
+                val = part.strip()
+                if val and val.lower() != "none":
+                    result[field].append(val)
+            return
+        result[field].append(item)
+
     active_list: str | None = None
     for line in lines:
         striped = line.strip()
@@ -225,29 +264,39 @@ def _parse_markdown_extraction(raw_output: str) -> dict[str, Any]:
             active_list = None
             continue
 
-        if lower.startswith("- source:"):
-            result["source"] = striped.split(":", 1)[1].strip()
+        normalized = striped.replace("**", "")
+        if normalized.startswith("-"):
+            normalized = normalized[1:].strip()
+        normalized_lower = normalized.lower()
+
+        if normalized_lower.startswith("source:"):
+            result["source"] = normalized.split(":", 1)[1].strip()
             active_list = None
             continue
-        if lower.startswith("- published_at:"):
-            result["published_at"] = striped.split(":", 1)[1].strip()
+        if normalized_lower.startswith("published_at:"):
+            result["published_at"] = normalized.split(":", 1)[1].strip()
             active_list = None
             continue
-        if lower.startswith("- headline:"):
-            result["headline"] = striped.split(":", 1)[1].strip()
+        if normalized_lower.startswith("headline:"):
+            result["headline"] = normalized.split(":", 1)[1].strip()
             active_list = None
             continue
-        if lower.startswith("- companies_named:"):
+        if normalized_lower.startswith("companies_named:"):
             active_list = "companies_named"
+            remainder = normalized.split(":", 1)[1].strip()
+            if remainder:
+                _add_list_items(active_list, remainder)
             continue
-        if lower.startswith("- event_keywords:"):
+        if normalized_lower.startswith("event_keywords:"):
             active_list = "event_keywords"
+            remainder = normalized.split(":", 1)[1].strip()
+            if remainder:
+                _add_list_items(active_list, remainder)
             continue
 
-        if striped.startswith("- ") and active_list is not None:
-            item = striped[2:].strip()
-            if item and item.lower() != "none":
-                result[active_list].append(item)
+        if active_list is not None and (striped.startswith("-") or striped.startswith("*")):
+            item = striped[1:].strip()
+            _add_list_items(active_list, item)
             continue
 
     return result
@@ -304,7 +353,13 @@ def _save_md_debug_output(
 
 
 def _build_extraction_prompt(article_text: str) -> str:
-    return _format_chat_prompt(AGENT1_SYSTEM_PROMPT, article_text)
+    # Match evaluation path: one user message via chat template.
+    user_content = (
+        f"{AGENT1_SYSTEM_PROMPT}\n\n"
+        "Article:\n"
+        f"{article_text}\n"
+    )
+    return _format_chat_prompt("", user_content)
 
 
 def _build_sentiment_prompt(article_text: str) -> str:
@@ -315,7 +370,7 @@ def _build_sentiment_prompt(article_text: str) -> str:
         "Respond with only one label.\n\n"
         f"Article:\n{article_text}\n\nLabel:"
     )
-    return _format_chat_prompt("You are a financial sentiment classifier.", user_prompt)
+    return _format_chat_prompt("", user_prompt)
 
 
 def _normalize_sentiment_label(raw_text: str) -> SentimentLabel:
@@ -369,15 +424,16 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
 
         for attempt_idx, token_budget in enumerate(token_budgets, start=1):
             raw_output = _generate_extraction_text(prompt, max_tokens=token_budget)
-            _save_md_debug_output(article_text, raw_output, attempt_idx, token_budget)
+            clean_output = _normalize_generated_text(raw_output)
+            _save_md_debug_output(article_text, clean_output, attempt_idx, token_budget)
             logger.info(
                 "FinGPT raw extraction output (attempt %d, max_tokens=%d): %s",
                 attempt_idx,
                 token_budget,
-                raw_output[:240],
+                clean_output[:240],
             )
             try:
-                extracted = _parse_extraction_structured(raw_output)
+                extracted = _parse_extraction_structured(clean_output)
                 break
             except json.JSONDecodeError as exc:
                 last_parse_error = exc

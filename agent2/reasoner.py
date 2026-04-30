@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 _DIAG_MD_DIR_ENV = "FINGPT_DIAG_MD_DIR"
+_SPECIAL_TOKEN_RE = re.compile(
+    r"(<\|[^>]+\|>|<｜[^｜]+｜>|<s>|</s>|\[INST\]|\[/INST\])"
+)
 
 _vllm_engine = None
 _chat_tokenizer = None
@@ -108,11 +111,15 @@ def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
     _ensure_chat_tokenizer()
     if _chat_tokenizer is not None and hasattr(_chat_tokenizer, "apply_chat_template"):
         try:
-            return _chat_tokenizer.apply_chat_template(
-                [
+            if system_prompt.strip():
+                messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
-                ],
+                ]
+            else:
+                messages = [{"role": "user", "content": user_content}]
+            return _chat_tokenizer.apply_chat_template(
+                messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -129,6 +136,12 @@ def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
 def _strip_code_fences(text: str) -> str:
     match = _CODE_FENCE_RE.search(text)
     return match.group(1).strip() if match else text.strip()
+
+
+def _normalize_generated_text(text: str) -> str:
+    cleaned = _SPECIAL_TOKEN_RE.sub(" ", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _extract_json_blob(text: str) -> str:
@@ -261,7 +274,8 @@ def _build_prompt(fingerprint: NewsFingerprint) -> str:
         "NewsFingerprint JSON:\n"
         f"{payload}\n"
     )
-    return _format_chat_prompt(SYSTEM_PROMPT, user_content)
+    # Match eval behavior: one user message, formatted by chat template.
+    return _format_chat_prompt("", f"{SYSTEM_PROMPT}\n\n{user_content}")
 
 
 def _log_thinking(thinking_text: str, ticker: str) -> None:
@@ -323,15 +337,16 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
             )
             outputs = _vllm_engine.generate([prompt], params)
             raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
-            _save_md_debug_output(fingerprint, raw_text, attempt_idx, token_budget)
+            clean_text = _normalize_generated_text(raw_text)
+            _save_md_debug_output(fingerprint, clean_text, attempt_idx, token_budget)
             logger.info(
                 "Agent 2 raw output (attempt %d, max_tokens=%d): %s",
                 attempt_idx,
                 token_budget,
-                raw_text[:300],
+                clean_text[:300],
             )
             try:
-                parsed = _parse_signal_structured(raw_text)
+                parsed = _parse_signal_structured(clean_text)
                 break
             except Exception as exc:
                 last_parse_error = exc
