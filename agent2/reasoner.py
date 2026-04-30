@@ -201,6 +201,10 @@ def _parse_json_signal(raw_text: str) -> dict[str, Any]:
 
 def _parse_markdown_signal(raw_text: str) -> dict[str, Any]:
     text = _strip_code_fences(raw_text)
+    signal_markers = list(re.finditer(r"(?im)^###\s*signal\b", text))
+    if signal_markers:
+        # Prefer the last complete SIGNAL block when multiple are present.
+        text = text[signal_markers[-1].start():]
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     result: dict[str, Any] = {
@@ -260,6 +264,42 @@ def _parse_markdown_signal(raw_text: str) -> dict[str, Any]:
             # Allow wrapped reasoning lines after `- cot:`.
             result["cot"] = f"{result['cot']} {line}".strip()
 
+    # Compact single-line fallback:
+    # "### SIGNAL-ticker: X - direction: long - strategy_tag: momentum - confidence: 0.7 - cot: ..."
+    if not result["ticker"] or not result["cot"]:
+        collapsed = " ".join(lines)
+        collapsed = re.sub(r"\s+", " ", collapsed).strip()
+        keys = ["ticker", "direction", "strategy_tag", "confidence", "cot"]
+        key_union = "|".join(keys)
+
+        def _extract(field: str) -> str:
+            pattern = rf"{field}\s*:\s*(.*?)(?=\s+-\s*(?:{key_union})\s*:|$)"
+            match = re.search(pattern, collapsed, flags=re.IGNORECASE)
+            return match.group(1).strip() if match else ""
+
+        ticker = _extract("ticker")
+        direction = _extract("direction").lower()
+        strategy_tag = _extract("strategy_tag").lower()
+        confidence_raw = _extract("confidence").replace("%", "").strip()
+        cot = _extract("cot")
+
+        if ticker:
+            result["ticker"] = ticker
+        if direction:
+            result["direction"] = direction
+        if strategy_tag:
+            result["strategy_tag"] = strategy_tag
+        if confidence_raw:
+            try:
+                conf = float(confidence_raw)
+                if conf > 1.0:
+                    conf = conf / 100.0
+                result["confidence"] = conf
+            except ValueError:
+                pass
+        if cot:
+            result["cot"] = cot
+
     return result
 
 
@@ -271,6 +311,57 @@ def _parse_signal_structured(raw_text: str) -> dict[str, Any]:
         if parsed.get("ticker") and parsed.get("cot"):
             return parsed
         raise
+
+
+def _parse_signal_fallback(raw_text: str, fingerprint: NewsFingerprint) -> dict[str, Any]:
+    """
+    Last-resort parser for loosely formatted model outputs.
+    """
+    text = raw_text.strip()
+    lower = text.lower()
+
+    ticker = fingerprint.companies_named[0] if fingerprint.companies_named else "UNKNOWN"
+
+    direction = "neutral"
+    if re.search(r"\b(long|bullish|buy)\b", lower):
+        direction = "long"
+    elif re.search(r"\b(short|bearish|sell)\b", lower):
+        direction = "short"
+
+    strategy_tag = "none"
+    strategy_patterns = {
+        "momentum": r"\bmomentum\b",
+        "mean_reversion": r"\bmean[\s_-]?reversion\b",
+        "event_driven": r"\bevent[\s_-]?driven\b",
+        "macro": r"\bmacro\b",
+    }
+    for tag, pattern in strategy_patterns.items():
+        if re.search(pattern, lower):
+            strategy_tag = tag
+            break
+
+    confidence = 0.5
+    conf_match = re.search(r"\bconfidence\b[^0-9]*(\d+(?:\.\d+)?)\s*%?", lower)
+    if conf_match:
+        conf_val = float(conf_match.group(1))
+        confidence = conf_val / 100.0 if conf_val > 1.0 else conf_val
+    confidence = max(0.0, min(1.0, confidence))
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    cot = " ".join(sentences[:3]).strip()
+    if not cot:
+        cot = (
+            f"Fallback parse used. Direction={direction}, "
+            f"strategy_tag={strategy_tag}, confidence={confidence:.2f}."
+        )
+
+    return {
+        "ticker": ticker,
+        "direction": direction,
+        "strategy_tag": strategy_tag,
+        "confidence": confidence,
+        "cot": cot,
+    }
 
 
 def _build_prompt(fingerprint: NewsFingerprint) -> str:
@@ -351,6 +442,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
         token_budgets = [1024, 1536]
         parsed: dict[str, Any] | None = None
         last_parse_error: Exception | None = None
+        last_clean_text = ""
 
         for attempt_idx, token_budget in enumerate(token_budgets, start=1):
             params = SamplingParams(
@@ -361,6 +453,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
             outputs = _vllm_engine.generate([prompt], params)
             raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
             clean_text = _normalize_generated_text(raw_text)
+            last_clean_text = clean_text
             _save_md_debug_output(fingerprint, clean_text, attempt_idx, token_budget)
             logger.info(
                 "Agent 2 raw output (attempt %d, max_tokens=%d): %s",
@@ -381,7 +474,11 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
                 )
 
         if parsed is None:
-            raise RuntimeError("Agent 2 failed to produce valid structured output.") from last_parse_error
+            logger.warning(
+                "Agent 2 structured parse failed after retries; using fallback parser. Last error: %s",
+                last_parse_error,
+            )
+            parsed = _parse_signal_fallback(last_clean_text, fingerprint)
 
         signal = TradingSignal(**parsed)
 
