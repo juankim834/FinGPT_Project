@@ -65,6 +65,24 @@ def extract_article_text(input_prompt: str) -> str:
         end_idx = len(text)
 
     news_block = text[start_idx:end_idx]
+
+    # Keep headline/summary pairs explicit so multi-news prompts remain structured.
+    pattern = re.compile(
+        r"\[Headline\]:\s*(.*?)\s*\[Summary\]:\s*(.*?)(?=\s*\[Headline\]:|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    pairs = pattern.findall(news_block)
+    if pairs:
+        rendered: list[str] = []
+        for idx, (headline, summary) in enumerate(pairs, start=1):
+            h = re.sub(r"\s+", " ", headline).strip()
+            s = re.sub(r"\s+", " ", summary).strip()
+            if not h and not s:
+                continue
+            rendered.append(f"News {idx}\nHeadline: {h}\nSummary: {s}")
+        return "\n\n".join(rendered).strip()
+
+    # Fallback for prompts that don't strictly follow headline/summary pair format.
     news_block = re.sub(r"\[(Headline|Summary)\]:", " ", news_block, flags=re.IGNORECASE)
     news_block = re.sub(r"\s+", " ", news_block).strip()
     return news_block

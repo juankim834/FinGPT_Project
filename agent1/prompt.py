@@ -8,7 +8,7 @@ SYSTEM_PROMPT: str = (
     "Return JSON with these fields:\n"
     "- source: publisher name or empty string\n"
     "- published_at: ISO datetime if present, or empty string\n"
-    "- headline: headline exactly as written\n"
+    "- headline: main headline; if multiple headlines are provided, write one concise combined headline\n"
     "- companies_named: list of company names or tickers\n"
     "- event_keywords: list of lowercase topic keywords"
 )
