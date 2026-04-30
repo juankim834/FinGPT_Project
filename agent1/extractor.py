@@ -14,9 +14,7 @@ from hashlib import md5
 from typing import Any, Optional
 
 from config import (
-    FINGPT_MAX_NEW_TOKENS,
     FINGPT_MODEL_PATH,
-    FINGPT_TEMPERATURE,
     LOG_LEVEL,
 )
 from agent1.prompt import SYSTEM_PROMPT as AGENT1_SYSTEM_PROMPT
@@ -315,13 +313,39 @@ def _parse_extraction_structured(raw_output: str) -> dict[str, Any]:
         raise
 
 
-def _generate_extraction_text(prompt: str, max_tokens: int) -> str:
+def _build_guided_extraction_schema() -> dict[str, Any]:
+    schema = NewsFingerprint.model_json_schema()
+    props = schema.get("properties", {})
+    required = schema.get("required", [])
+    for field in ("sentiment_label", "sentiment_score", "sentiment_confidence"):
+        props.pop(field, None)
+        if field in required:
+            required.remove(field)
+    return schema
+
+
+def _generate_extraction_text(
+    prompt: str,
+    max_tokens: int,
+    guided_schema: Optional[dict[str, Any]] = None,
+) -> str:
     from vllm import SamplingParams  # type: ignore
 
-    params = SamplingParams(
-        max_tokens=max_tokens,
-        temperature=FINGPT_TEMPERATURE,
-    )
+    params_kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+    }
+    if guided_schema is not None:
+        try:
+            from vllm.sampling_params import GuidedDecodingParams  # type: ignore
+
+            params_kwargs["guided_decoding"] = GuidedDecodingParams(json=guided_schema)
+        except ImportError:
+            logger.warning(
+                "Guided decoding unavailable in current vLLM version; "
+                "falling back to non-guided extraction."
+            )
+    params = SamplingParams(**params_kwargs)
     outputs = _vllm_engine.generate([prompt], params)
     return outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
 
@@ -354,11 +378,7 @@ def _save_md_debug_output(
 
 def _build_extraction_prompt(article_text: str) -> str:
     # Match evaluation path: one user message via chat template.
-    user_content = (
-        f"{AGENT1_SYSTEM_PROMPT}\n\n"
-        "Article:\n"
-        f"{article_text}\n"
-    )
+    user_content = f"{AGENT1_SYSTEM_PROMPT}\n\nArticle:\n{article_text}"
     return _format_chat_prompt("", user_content)
 
 
@@ -418,42 +438,22 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
         _load_model()
 
         prompt = _build_extraction_prompt(article_text)
-        token_budgets = [FINGPT_MAX_NEW_TOKENS, max(FINGPT_MAX_NEW_TOKENS * 2, 1024)]
-        extracted: dict[str, Any] | None = None
-        last_parse_error: Exception | None = None
-
-        for attempt_idx, token_budget in enumerate(token_budgets, start=1):
-            raw_output = _generate_extraction_text(prompt, max_tokens=token_budget)
-            clean_output = _normalize_generated_text(raw_output)
-            _save_md_debug_output(article_text, clean_output, attempt_idx, token_budget)
-            logger.info(
-                "FinGPT raw extraction output (attempt %d, max_tokens=%d): %s",
-                attempt_idx,
-                token_budget,
-                clean_output[:240],
-            )
-            try:
-                extracted = _parse_extraction_structured(clean_output)
-                break
-            except json.JSONDecodeError as exc:
-                last_parse_error = exc
-                logger.warning(
-                    "Agent 1 JSON parse failed (attempt %d, max_tokens=%d): %s",
-                    attempt_idx,
-                    token_budget,
-                    exc,
-                )
-            except Exception as exc:
-                last_parse_error = exc
-                logger.warning(
-                    "Agent 1 structured parse failed (attempt %d, max_tokens=%d): %s",
-                    attempt_idx,
-                    token_budget,
-                    exc,
-                )
-
-        if extracted is None:
-            raise RuntimeError("Agent 1 failed to produce valid JSON output.") from last_parse_error
+        guided_schema = _build_guided_extraction_schema()
+        token_budget = 512
+        raw_output = _generate_extraction_text(
+            prompt,
+            max_tokens=token_budget,
+            guided_schema=guided_schema,
+        )
+        clean_output = _normalize_generated_text(raw_output)
+        _save_md_debug_output(article_text, clean_output, 1, token_budget)
+        logger.info(
+            "FinGPT raw extraction output (attempt %d, max_tokens=%d): %s",
+            1,
+            token_budget,
+            clean_output[:240],
+        )
+        extracted = _parse_extraction_structured(clean_output)
 
         sentiment = _score_sentiment(article_text)
         logger.info("Agent 1 sentiment logits: %s", sentiment["sentiment_logits"])

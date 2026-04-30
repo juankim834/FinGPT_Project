@@ -383,12 +383,13 @@ def _build_prompt(fingerprint: NewsFingerprint) -> str:
     )
 
     user_content = (
+        f"{SYSTEM_PROMPT}\n\n"
         f"{sentiment_line}\n\n"
         "NewsFingerprint JSON:\n"
-        f"{payload}\n"
+        f"{payload}"
     )
     # Match eval behavior: one user message, formatted by chat template.
-    return _format_chat_prompt(SYSTEM_PROMPT, user_content)
+    return _format_chat_prompt("", user_content)
 
 
 def _log_thinking(thinking_text: str, ticker: str) -> None:
@@ -439,46 +440,42 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
         from vllm import SamplingParams  # type: ignore
 
         prompt = _build_prompt(fingerprint)
-        token_budgets = [1024, 1536]
-        parsed: dict[str, Any] | None = None
-        last_parse_error: Exception | None = None
-        last_clean_text = ""
+        signal_schema = TradingSignal.model_json_schema()
+        params_kwargs: dict[str, Any] = {
+            "max_tokens": 256,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        }
+        try:
+            from vllm.sampling_params import GuidedDecodingParams  # type: ignore
 
-        for attempt_idx, token_budget in enumerate(token_budgets, start=1):
-            params = SamplingParams(
-                max_tokens=token_budget,
-                temperature=0.0,
-                top_p=1.0,
-            )
-            outputs = _vllm_engine.generate([prompt], params)
-            raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
-            clean_text = _normalize_generated_text(raw_text)
-            last_clean_text = clean_text
-            _save_md_debug_output(fingerprint, clean_text, attempt_idx, token_budget)
-            logger.info(
-                "Agent 2 raw output (attempt %d, max_tokens=%d): %s",
-                attempt_idx,
-                token_budget,
-                clean_text[:300],
-            )
-            try:
-                parsed = _parse_signal_structured(clean_text)
-                break
-            except Exception as exc:
-                last_parse_error = exc
-                logger.warning(
-                    "Agent 2 parse failed (attempt %d, max_tokens=%d): %s",
-                    attempt_idx,
-                    token_budget,
-                    exc,
-                )
-
-        if parsed is None:
+            params_kwargs["guided_decoding"] = GuidedDecodingParams(json=signal_schema)
+        except ImportError:
             logger.warning(
-                "Agent 2 structured parse failed after retries; using fallback parser. Last error: %s",
-                last_parse_error,
+                "Guided decoding unavailable in current vLLM version; "
+                "falling back to non-guided signal generation."
             )
-            parsed = _parse_signal_fallback(last_clean_text, fingerprint)
+
+        params = SamplingParams(**params_kwargs)
+        outputs = _vllm_engine.generate([prompt], params)
+        raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
+        clean_text = _normalize_generated_text(raw_text)
+        _save_md_debug_output(fingerprint, clean_text, 1, 256)
+        logger.info(
+            "Agent 2 raw output (attempt %d, max_tokens=%d): %s",
+            1,
+            256,
+            clean_text[:300],
+        )
+
+        try:
+            parsed = _parse_signal_structured(clean_text)
+        except Exception as exc:
+            logger.warning(
+                "Agent 2 structured parse failed; using fallback parser. Error: %s",
+                exc,
+            )
+            parsed = _parse_signal_fallback(clean_text, fingerprint)
 
         signal = TradingSignal(**parsed)
 
