@@ -24,7 +24,7 @@ FINGPT_ADAPTER_PATH: str = os.getenv("FINGPT_ADAPTER_PATH", "")
 SHARE_SINGLE_LLM_BETWEEN_AGENTS: bool = _env_bool("SHARE_SINGLE_LLM_BETWEEN_AGENTS", False)
 
 # Generation settings for FinGPT fact extraction
-FINGPT_MAX_NEW_TOKENS: int = 512
+FINGPT_MAX_NEW_TOKENS: int = 1024
 FINGPT_TEMPERATURE: float = 0.0   # deterministic extraction; no creative generation
 
 # ---------------------------------------------------------------------------
