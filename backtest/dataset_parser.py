@@ -60,11 +60,19 @@ def load_dataset(path: str) -> pd.DataFrame:
     df = df.rename(columns=column_aliases)
 
     required = ["input", "output", "answer", "ticker"]
+    normalized = pd.DataFrame(index=df.index)
     for col in required:
         if col not in df.columns:
-            df[col] = ""
+            normalized[col] = ""
+            continue
 
-    return df[required].copy()
+        selected = df[col]
+        # Handle duplicate column labels that return a DataFrame.
+        if isinstance(selected, pd.DataFrame):
+            selected = selected.iloc[:, 0]
+        normalized[col] = selected
+
+    return normalized.reset_index(drop=True)
 
 
 def extract_article_text(input_prompt: str) -> str:
@@ -133,16 +141,27 @@ def build_backtest_rows(df: pd.DataFrame) -> list[dict]:
     """
     Convert dataset rows into normalized backtest rows.
     """
+    def _row_value(row_obj: pd.Series, key: str) -> str:
+        raw = row_obj.get(key, "")
+        if isinstance(raw, pd.Series):
+            for value in raw.tolist():
+                if pd.notna(value):
+                    return str(value)
+            return ""
+        if pd.isna(raw):
+            return ""
+        return str(raw)
+
     rows: list[dict] = []
     for _, row in df.iterrows():
-        raw_input = str(row.get("input", "") or "")
-        ticker = str(row.get("ticker", "") or "").strip().upper()
+        raw_input = _row_value(row, "input")
+        ticker = _row_value(row, "ticker").strip().upper()
         article_text = extract_article_text(raw_input)
         if not ticker or not article_text:
             continue
 
         start_date, end_date = extract_date_range(raw_input)
-        fingpt_label = parse_fingpt_label(str(row.get("answer", "") or ""))
+        fingpt_label = parse_fingpt_label(_row_value(row, "answer"))
 
         rows.append(
             {
