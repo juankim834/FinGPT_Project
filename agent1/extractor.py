@@ -1,7 +1,7 @@
 """
 agent1/extractor.py — Agent 1: FinGPT fact + sentiment extractor.
 
-The module keeps a lazy, single-load HuggingFace setup and exposes one public
+The module keeps a lazy, single-load vLLM setup and exposes one public
 API: extract_fingerprint(article_text) -> Optional[NewsFingerprint].
 """
 
@@ -10,15 +10,11 @@ import logging
 import re
 from typing import Optional
 
-import torch
-
 from config import (
-    FINGPT_ADAPTER_PATH,
     FINGPT_MAX_NEW_TOKENS,
     FINGPT_MODEL_PATH,
     FINGPT_TEMPERATURE,
     LOG_LEVEL,
-    SHARE_SINGLE_LLM_BETWEEN_AGENTS,
 )
 from agent1.schema import NewsFingerprint, SentimentLabel
 
@@ -55,17 +51,14 @@ _SENTIMENT_VALUES: dict[SentimentLabel, int] = {
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-_tokenizer = None
-_model = None
-_generator = None
-_runtime_device = None
+_vllm_engine = None
 
 
 def _load_model() -> None:
-    """Lazy-load tokenizer/model/pipeline once, using bf16 on CUDA."""
-    global _tokenizer, _model, _generator, _runtime_device  # noqa: PLW0603
+    """Lazy-load one vLLM engine once."""
+    global _vllm_engine  # noqa: PLW0603
 
-    if _model is not None and _tokenizer is not None and _generator is not None:
+    if _vllm_engine is not None:
         return
 
     if not FINGPT_MODEL_PATH:
@@ -73,43 +66,36 @@ def _load_model() -> None:
             "FINGPT_MODEL_PATH is not set. Add it to your .env pointing to local weights."
         )
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # type: ignore
-
-    has_cuda = torch.cuda.is_available()
-    _runtime_device = torch.device("cuda" if has_cuda else "cpu")
-    torch_dtype = torch.bfloat16 if has_cuda else torch.float32
+    from vllm import LLM  # type: ignore
 
     logger.info("Loading FinGPT model from: %s", FINGPT_MODEL_PATH)
-    _tokenizer = AutoTokenizer.from_pretrained(FINGPT_MODEL_PATH)
-    _model = AutoModelForCausalLM.from_pretrained(
-        FINGPT_MODEL_PATH,
-        torch_dtype=torch_dtype,
-        device_map="auto" if has_cuda else None,
+    _vllm_engine = LLM(
+        model=FINGPT_MODEL_PATH,
+        trust_remote_code=True,
+        dtype="auto",
+        gpu_memory_utilization=0.85,
+        disable_log_stats=True,
+        enforce_eager=True,
     )
-    if FINGPT_ADAPTER_PATH:
-        from peft import PeftModel  # type: ignore
-
-        logger.info("Applying LoRA adapter from: %s", FINGPT_ADAPTER_PATH)
-        _model = PeftModel.from_pretrained(_model, FINGPT_ADAPTER_PATH)
-    if not has_cuda:
-        _model.to(_runtime_device)
-    _model.eval()
-
-    _generator = pipeline(
-        task="text-generation",
-        model=_model,
-        tokenizer=_tokenizer,
-    )
-    if SHARE_SINGLE_LLM_BETWEEN_AGENTS:
-        logger.info("Shared FinGPT model loaded on %s for both agents.", _runtime_device)
-    else:
-        logger.info("FinGPT model and pipeline loaded on %s.", _runtime_device)
+    logger.info("FinGPT vLLM engine loaded.")
 
 
 def get_loaded_model_and_tokenizer():
-    """Return the loaded Agent 1 model/tokenizer pair (loading lazily if needed)."""
-    _load_model()
-    return _model, _tokenizer
+    """
+    Backward compatibility shim for Agent 2 shared-loader path.
+
+    Agent 1 now uses vLLM directly, so no HF model/tokenizer pair is returned.
+    """
+    return None, None
+
+
+def set_shared_vllm_engine(engine) -> None:
+    """
+    Inject a preloaded vLLM engine (e.g., from notebook bootstrap) for reuse.
+    """
+    global _vllm_engine  # noqa: PLW0603
+    _vllm_engine = engine
+    logger.info("Injected shared vLLM engine into Agent 1 extractor.")
 
 
 def _strip_code_fences(text: str) -> str:
@@ -141,79 +127,29 @@ def _build_sentiment_prompt(article_text: str) -> str:
     )
 
 
-def _sum_candidate_log_prob(prompt_text: str, candidate_label: SentimentLabel) -> float:
-    prompt_inputs = _tokenizer(prompt_text, return_tensors="pt")
-    model_device = next(_model.parameters()).device
-    prompt_inputs = {k: v.to(model_device) for k, v in prompt_inputs.items()}
-
-    candidate_ids = _tokenizer(
-        f" {candidate_label}",
-        add_special_tokens=False,
-        return_tensors="pt",
-    )["input_ids"].to(model_device)
-
-    full_input_ids = torch.cat((prompt_inputs["input_ids"], candidate_ids), dim=1)
-    full_attention = torch.ones_like(full_input_ids, device=model_device)
-
-    with torch.no_grad():
-        outputs = _model(input_ids=full_input_ids, attention_mask=full_attention)
-        log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
-        targets = full_input_ids[:, 1:]
-        token_log_probs = log_probs.gather(dim=2, index=targets.unsqueeze(-1)).squeeze(-1)
-
-    prompt_len = prompt_inputs["input_ids"].shape[1]
-    candidate_len = candidate_ids.shape[1]
-    start = prompt_len - 1
-    end = start + candidate_len
-    return float(token_log_probs[0, start:end].sum().item())
+def _normalize_sentiment_label(raw_text: str) -> SentimentLabel:
+    text = raw_text.strip().lower()
+    for label in _SENTIMENT_LABELS:
+        if label in text:
+            return label
+    # Deterministic fallback if model returns unexpected wording.
+    return "neutral"
 
 
 def _score_sentiment(article_text: str) -> dict[str, float | str]:
     """
-    Compute sentiment from token log-probabilities over fixed candidate labels.
-
-    Method:
-    1) Build a classification prompt and call `model.generate(..., max_new_tokens=1,
-       return_dict_in_generate=True, output_scores=True)` to collect the next-token
-       score distribution from the same generation stack used in production.
-    2) Because labels are multi-token strings, compute each candidate's sequence
-       log-probability using teacher forcing: append the candidate tokens to the
-       prompt, run a forward pass, and sum per-token log-probs at the candidate
-       positions.
-    3) Apply softmax across the five candidate scores to get probabilities, then
-       map labels to {-2,-1,0,1,2} and compute the expected value as sentiment_score.
+    Classify sentiment using deterministic vLLM decoding over fixed labels.
     """
+    from vllm import SamplingParams  # type: ignore
+
     prompt = _build_sentiment_prompt(article_text)
-    model_device = next(_model.parameters()).device
-    prompt_inputs = _tokenizer(prompt, return_tensors="pt")
-    prompt_inputs = {k: v.to(model_device) for k, v in prompt_inputs.items()}
+    params = SamplingParams(max_tokens=6, temperature=0.0)
+    outputs = _vllm_engine.generate([prompt], params)
+    raw = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
 
-    # Single-token generation probe requested by design constraints.
-    with torch.no_grad():
-        _ = _model.generate(
-            **prompt_inputs,
-            max_new_tokens=1,
-            do_sample=False,
-            return_dict_in_generate=True,
-            output_scores=True,
-            pad_token_id=_tokenizer.eos_token_id,
-        )
-
-    candidate_scores = torch.tensor(
-        [_sum_candidate_log_prob(prompt, label) for label in _SENTIMENT_LABELS],
-        dtype=torch.float32,
-    )
-    probs = torch.softmax(candidate_scores, dim=0)
-
-    best_idx = int(torch.argmax(probs).item())
-    sentiment_label = _SENTIMENT_LABELS[best_idx]
-    sentiment_confidence = float(probs[best_idx].item())
-    sentiment_score = float(
-        sum(
-            probs[i].item() * _SENTIMENT_VALUES[_SENTIMENT_LABELS[i]]
-            for i in range(len(_SENTIMENT_LABELS))
-        )
-    )
+    sentiment_label = _normalize_sentiment_label(raw)
+    sentiment_score = float(_SENTIMENT_VALUES[sentiment_label])
+    sentiment_confidence = 1.0
 
     return {
         "sentiment_label": sentiment_label,
@@ -230,17 +166,15 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
     """
     try:
         _load_model()
+        from vllm import SamplingParams  # type: ignore
 
         prompt = _build_extraction_prompt(article_text)
-        outputs = _generator(
-            prompt,
-            max_new_tokens=FINGPT_MAX_NEW_TOKENS,
+        params = SamplingParams(
+            max_tokens=FINGPT_MAX_NEW_TOKENS,
             temperature=FINGPT_TEMPERATURE,
-            do_sample=False,
-            return_full_text=False,
-            pad_token_id=_tokenizer.eos_token_id,
         )
-        raw_output = outputs[0]["generated_text"] if outputs else ""
+        outputs = _vllm_engine.generate([prompt], params)
+        raw_output = outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
         logger.info("FinGPT raw extraction output: %s", raw_output[:240])
 
         extracted = json.loads(_extract_json_blob(raw_output))

@@ -46,8 +46,13 @@ def _load_model() -> None:
         from agent1.extractor import get_loaded_model_and_tokenizer
 
         _model, _tokenizer = get_loaded_model_and_tokenizer()
-        logger.info("Agent 2 reusing shared model instance from Agent 1.")
-        return
+        if _model is not None and _tokenizer is not None:
+            logger.info("Agent 2 reusing shared model instance from Agent 1.")
+            return
+        logger.info(
+            "Agent 1 is running on vLLM without HF model/tokenizer export; "
+            "Agent 2 will load its dedicated local HF model."
+        )
 
     if not FINGPT_MODEL_PATH:
         raise EnvironmentError(
