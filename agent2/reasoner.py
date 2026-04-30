@@ -469,14 +469,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
             clean_text[:300],
         )
 
-        try:
-            parsed = _parse_signal_structured(clean_text)
-        except Exception as exc:
-            logger.warning(
-                "Agent 2 structured parse failed; using fallback parser. Error: %s",
-                exc,
-            )
-            parsed = _parse_signal_fallback(clean_text, fingerprint)
+        parsed = _parse_signal_structured(clean_text)
 
         signal = TradingSignal(**parsed)
 
