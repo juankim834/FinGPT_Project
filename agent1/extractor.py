@@ -8,7 +8,7 @@ API: extract_fingerprint(article_text) -> Optional[NewsFingerprint].
 import json
 import logging
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from config import (
     FINGPT_MAX_NEW_TOKENS,
@@ -16,22 +16,11 @@ from config import (
     FINGPT_TEMPERATURE,
     LOG_LEVEL,
 )
+from agent1.prompt import SYSTEM_PROMPT as AGENT1_SYSTEM_PROMPT
 from agent1.schema import NewsFingerprint, SentimentLabel
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
-
-_EXTRACTION_SYSTEM_PROMPT = (
-    "You are a financial news fact extractor.\n"
-    "Return exactly one JSON object with keys:\n"
-    'source, published_at, headline, companies_named, event_keywords\n'
-    "Rules:\n"
-    "- Only use explicit article facts.\n"
-    "- headline must be copied exactly from text when present.\n"
-    "- companies_named should include all company names/tickers in the article.\n"
-    "- event_keywords must be lowercase short keywords copied from text.\n"
-    "- No markdown, no commentary, no extra keys."
-)
 
 _SENTIMENT_LABELS: list[SentimentLabel] = [
     "strongly bullish",
@@ -114,9 +103,134 @@ def _extract_json_blob(text: str) -> str:
     return match.group(0).strip() if match else cleaned
 
 
+def _extract_balanced_json_blob(text: str) -> str:
+    """
+    Extract first balanced JSON object from text with string-aware brace matching.
+    Returns empty string if no balanced object is found.
+    """
+    cleaned = _strip_code_fences(text)
+    start = cleaned.find("{")
+    if start < 0:
+        return ""
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(cleaned)):
+        ch = cleaned[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start : i + 1].strip()
+    return ""
+
+
+def _parse_extracted_json(raw_output: str) -> dict[str, Any]:
+    """
+    Parse extraction JSON robustly from model output.
+    """
+    primary = _extract_json_blob(raw_output)
+    try:
+        return json.loads(primary)
+    except json.JSONDecodeError:
+        balanced = _extract_balanced_json_blob(raw_output)
+        if balanced:
+            return json.loads(balanced)
+        raise
+
+
+def _parse_markdown_extraction(raw_output: str) -> dict[str, Any]:
+    """
+    Parse Agent 1 markdown contract into JSON-like dict.
+    """
+    text = _strip_code_fences(raw_output)
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+
+    result: dict[str, Any] = {
+        "source": "",
+        "published_at": "",
+        "headline": "",
+        "companies_named": [],
+        "event_keywords": [],
+    }
+
+    active_list: str | None = None
+    for line in lines:
+        striped = line.strip()
+        lower = striped.lower()
+
+        if lower.startswith("### "):
+            active_list = None
+            continue
+
+        if lower.startswith("- source:"):
+            result["source"] = striped.split(":", 1)[1].strip()
+            active_list = None
+            continue
+        if lower.startswith("- published_at:"):
+            result["published_at"] = striped.split(":", 1)[1].strip()
+            active_list = None
+            continue
+        if lower.startswith("- headline:"):
+            result["headline"] = striped.split(":", 1)[1].strip()
+            active_list = None
+            continue
+        if lower.startswith("- companies_named:"):
+            active_list = "companies_named"
+            continue
+        if lower.startswith("- event_keywords:"):
+            active_list = "event_keywords"
+            continue
+
+        if striped.startswith("- ") and active_list is not None:
+            item = striped[2:].strip()
+            if item and item.lower() != "none":
+                result[active_list].append(item)
+            continue
+
+    return result
+
+
+def _parse_extraction_structured(raw_output: str) -> dict[str, Any]:
+    """
+    Parse model output that may be JSON or markdown.
+    """
+    try:
+        return _parse_extracted_json(raw_output)
+    except Exception:
+        parsed = _parse_markdown_extraction(raw_output)
+        if parsed.get("headline") or parsed.get("companies_named"):
+            return parsed
+        raise
+
+
+def _generate_extraction_text(prompt: str, max_tokens: int) -> str:
+    from vllm import SamplingParams  # type: ignore
+
+    params = SamplingParams(
+        max_tokens=max_tokens,
+        temperature=FINGPT_TEMPERATURE,
+    )
+    outputs = _vllm_engine.generate([prompt], params)
+    return outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
+
+
 def _build_extraction_prompt(article_text: str) -> str:
     return (
-        f"<|system|>\n{_EXTRACTION_SYSTEM_PROMPT}\n"
+        f"<|system|>\n{AGENT1_SYSTEM_PROMPT}\n"
         f"<|user|>\n{article_text}\n"
         "<|assistant|>\n"
     )
@@ -141,7 +255,7 @@ def _normalize_sentiment_label(raw_text: str) -> SentimentLabel:
     return "neutral"
 
 
-def _score_sentiment(article_text: str) -> dict[str, float | str]:
+def _score_sentiment(article_text: str) -> dict[str, Any]:
     """
     Classify sentiment using deterministic vLLM decoding over fixed labels.
     """
@@ -155,11 +269,15 @@ def _score_sentiment(article_text: str) -> dict[str, float | str]:
     sentiment_label = _normalize_sentiment_label(raw)
     sentiment_score = float(_SENTIMENT_VALUES[sentiment_label])
     sentiment_confidence = 1.0
+    sentiment_logits = {
+        label: (1.0 if label == sentiment_label else 0.0) for label in _SENTIMENT_LABELS
+    }
 
     return {
         "sentiment_label": sentiment_label,
         "sentiment_score": sentiment_score,
         "sentiment_confidence": sentiment_confidence,
+        "sentiment_logits": sentiment_logits,
     }
 
 
@@ -171,19 +289,45 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
     """
     try:
         _load_model()
-        from vllm import SamplingParams  # type: ignore
 
         prompt = _build_extraction_prompt(article_text)
-        params = SamplingParams(
-            max_tokens=FINGPT_MAX_NEW_TOKENS,
-            temperature=FINGPT_TEMPERATURE,
-        )
-        outputs = _vllm_engine.generate([prompt], params)
-        raw_output = outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
-        logger.info("FinGPT raw extraction output: %s", raw_output[:240])
+        token_budgets = [FINGPT_MAX_NEW_TOKENS, max(FINGPT_MAX_NEW_TOKENS * 2, 1024)]
+        extracted: dict[str, Any] | None = None
+        last_parse_error: Exception | None = None
 
-        extracted = json.loads(_extract_json_blob(raw_output))
+        for attempt_idx, token_budget in enumerate(token_budgets, start=1):
+            raw_output = _generate_extraction_text(prompt, max_tokens=token_budget)
+            logger.info(
+                "FinGPT raw extraction output (attempt %d, max_tokens=%d): %s",
+                attempt_idx,
+                token_budget,
+                raw_output[:240],
+            )
+            try:
+                extracted = _parse_extraction_structured(raw_output)
+                break
+            except json.JSONDecodeError as exc:
+                last_parse_error = exc
+                logger.warning(
+                    "Agent 1 JSON parse failed (attempt %d, max_tokens=%d): %s",
+                    attempt_idx,
+                    token_budget,
+                    exc,
+                )
+            except Exception as exc:
+                last_parse_error = exc
+                logger.warning(
+                    "Agent 1 structured parse failed (attempt %d, max_tokens=%d): %s",
+                    attempt_idx,
+                    token_budget,
+                    exc,
+                )
+
+        if extracted is None:
+            raise RuntimeError("Agent 1 failed to produce valid JSON output.") from last_parse_error
+
         sentiment = _score_sentiment(article_text)
+        logger.info("Agent 1 sentiment logits: %s", sentiment["sentiment_logits"])
 
         payload = {
             "source": extracted.get("source", ""),
