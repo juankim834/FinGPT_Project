@@ -17,7 +17,7 @@ _DATE_RANGE_RE = re.compile(
 
 def load_dataset(path: str) -> pd.DataFrame:
     """
-    Load dataset from a local parquet or CSV file.
+    Load dataset from local parquet/CSV or Hugging Face dataset ID.
     Returns a DataFrame with normalized columns: input, output, answer, ticker.
     """
     lower = path.lower()
@@ -26,7 +26,26 @@ def load_dataset(path: str) -> pd.DataFrame:
     elif lower.endswith(".csv"):
         df = pd.read_csv(path)
     else:
-        raise ValueError("Unsupported dataset format. Use .parquet or .csv")
+        try:
+            from datasets import Dataset, DatasetDict, load_dataset as hf_load_dataset
+        except Exception as exc:
+            raise ValueError(
+                "Unsupported dataset source. Use .parquet/.csv or install `datasets` "
+                "to load a Hugging Face dataset ID."
+            ) from exc
+
+        loaded = hf_load_dataset(path)
+        if isinstance(loaded, Dataset):
+            hf_ds = loaded
+        elif isinstance(loaded, DatasetDict):
+            split_priority = ("test", "validation", "train")
+            split = next((name for name in split_priority if name in loaded), None)
+            if split is None:
+                split = next(iter(loaded.keys()))
+            hf_ds = loaded[split]
+        else:
+            raise ValueError(f"Unexpected dataset object type: {type(loaded).__name__}")
+        df = hf_ds.to_pandas()
 
     # Normalize common naming variants to required names.
     normalized_columns = {col: col.strip().lower() for col in df.columns}
