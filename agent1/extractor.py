@@ -457,7 +457,7 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
 
         prompt = _build_extraction_prompt(article_text)
         guided_schema = _build_guided_extraction_schema()
-        token_budget = 768
+        token_budget = 2048
         raw_output = _generate_extraction_text(
             prompt,
             max_tokens=token_budget,
