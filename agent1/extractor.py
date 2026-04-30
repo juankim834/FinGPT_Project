@@ -98,6 +98,11 @@ def set_shared_vllm_engine(engine) -> None:
     logger.info("Injected shared vLLM engine into Agent 1 extractor.")
 
 
+def get_shared_vllm_engine():
+    """Return Agent 1 vLLM engine if already initialized/injected."""
+    return _vllm_engine
+
+
 def _strip_code_fences(text: str) -> str:
     match = _CODE_FENCE_RE.search(text)
     return match.group(1).strip() if match else text.strip()
