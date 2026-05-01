@@ -11,14 +11,17 @@ from typing import Optional
 
 import pandas as pd
 
-from agent1.extractor import extract_fingerprint
-from agent2.reasoner import generate_signal
+from agent1.extractor import extract_fingerprint_batch
+from agent2.reasoner import generate_signal_batch
 from backtest.dataset_parser import build_backtest_rows, load_dataset
 from backtest.price_fetcher import direction_from_return, get_realized_return
 from config import LOG_LEVEL
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+
+_BATCH_SIZE = 10
 
 
 def _position_from_direction(direction: str) -> int:
@@ -29,6 +32,31 @@ def _position_from_direction(direction: str) -> int:
     return 0
 
 
+def _make_base_result(row: dict) -> dict:
+    return {
+        "ticker": row["ticker"],
+        "start_date": row["start_date"],
+        "end_date": row["end_date"],
+        "article_text": row["article_text"][:120],
+        "fingpt_label": row["fingpt_label"],
+        # Agent 1 sentiment (logits-derived)
+        "sentiment_label": None,
+        "sentiment_confidence": None,
+        "sentiment_probabilities": None,
+        # Agent 2 signal (logits-derived)
+        "signal_direction": None,
+        "signal_confidence": None,
+        "signal_strategy_tag": None,
+        "signal_logits": None,
+        "signal_probabilities": None,
+        # Backtest metrics
+        "realized_return": None,
+        "position": None,
+        "strategy_return": None,
+        "skipped_reason": "",
+    }
+
+
 def run_backtest(
     dataset_path: str,
     output_path: str = "output/backtest_results.csv",
@@ -36,6 +64,14 @@ def run_backtest(
 ) -> pd.DataFrame:
     """
     Run the full news2signal pipeline and persist detailed results.
+
+    vLLM inference runs in batches of ``_BATCH_SIZE`` (default 10).  Each batch
+    makes three vLLM calls:
+      1. Guided fact-extraction (all articles in the batch, single call).
+      2. Sentiment CoT + logits (all articles in the batch, single call).
+      3. Strategy CoT + logits (valid fingerprints only, single call).
+    Per-item result assembly, price fetching, and CSV serialisation are
+    unchanged from the single-item version.
     """
     df = load_dataset(dataset_path)
     rows = build_backtest_rows(df)
@@ -44,66 +80,100 @@ def run_backtest(
 
     results: list[dict] = []
     total = len(rows)
-    for idx, row in enumerate(rows, start=1):
-        if idx % 10 == 0:
-            logger.info("Backtest progress: %d/%d rows processed", idx, total)
 
-        base_result = {
-            "ticker": row["ticker"],
-            "start_date": row["start_date"],
-            "end_date": row["end_date"],
-            "article_text": row["article_text"][:120],
-            "fingpt_label": row["fingpt_label"],
-            "signal_direction": None,
-            "signal_confidence": None,
-            "signal_strategy_tag": None,
-            "realized_return": None,
-            "position": None,
-            "strategy_return": None,
-            "skipped_reason": "",
-        }
+    for batch_start in range(0, total, _BATCH_SIZE):
+        batch = rows[batch_start : batch_start + _BATCH_SIZE]
+        batch_end = batch_start + len(batch)
+        logger.info(
+            "Backtest progress: rows %d–%d / %d", batch_start + 1, batch_end, total
+        )
 
+        # --- Agent 1: batch extract fingerprints (2 vLLM calls) ---
         try:
-            fingerprint = extract_fingerprint(row["article_text"])
-            if fingerprint is None:
-                base_result["skipped_reason"] = "fingerprint_failed"
-                results.append(base_result)
-                continue
-
-            signal = generate_signal(fingerprint)
-            if signal is None:
-                base_result["skipped_reason"] = "signal_failed"
-                results.append(base_result)
-                continue
-
-            realized_return = get_realized_return(
-                ticker=row["ticker"],
-                start_date=row["start_date"],
-                end_date=row["end_date"],
+            fingerprints = extract_fingerprint_batch(
+                [r["article_text"] for r in batch]
             )
-            if realized_return is None:
+        except Exception as exc:
+            logger.exception(
+                "extract_fingerprint_batch failed for rows %d-%d: %s",
+                batch_start + 1, batch_end, exc,
+            )
+            fingerprints = [None] * len(batch)
+
+        # --- Agent 2: batch generate signals (1 vLLM call, valid FPs only) ---
+        valid_pairs: list[tuple[int, object]] = [
+            (j, fp) for j, fp in enumerate(fingerprints) if fp is not None
+        ]
+        batch_signals: list = [None] * len(batch)
+        if valid_pairs:
+            valid_indices, valid_fps = zip(*valid_pairs)
+            try:
+                raw_signals = generate_signal_batch(list(valid_fps))  # type: ignore[arg-type]
+            except Exception as exc:
+                logger.exception(
+                    "generate_signal_batch failed for rows %d-%d: %s",
+                    batch_start + 1, batch_end, exc,
+                )
+                raw_signals = [None] * len(valid_fps)
+            for k, j in enumerate(valid_indices):
+                batch_signals[j] = raw_signals[k]
+
+        # --- Per-row result assembly (output logic unchanged) ---
+        for j, row in enumerate(batch):
+            base_result = _make_base_result(row)
+            fingerprint = fingerprints[j]
+            signal = batch_signals[j]
+
+            try:
+                if fingerprint is None:
+                    base_result["skipped_reason"] = "fingerprint_failed"
+                    results.append(base_result)
+                    continue
+
+                base_result["sentiment_label"] = fingerprint.sentiment_label
+                base_result["sentiment_confidence"] = fingerprint.sentiment_confidence
+                base_result["sentiment_probabilities"] = str(
+                    fingerprint.sentiment_probabilities
+                )
+
+                if signal is None:
+                    base_result["skipped_reason"] = "signal_failed"
+                    results.append(base_result)
+                    continue
+
+                realized_return = get_realized_return(
+                    ticker=row["ticker"],
+                    start_date=row["start_date"],
+                    end_date=row["end_date"],
+                )
+
                 base_result["signal_direction"] = signal.direction
                 base_result["signal_confidence"] = signal.confidence
                 base_result["signal_strategy_tag"] = signal.strategy_tag
-                base_result["skipped_reason"] = "price_fetch_failed"
+                base_result["signal_logits"] = str(signal.signal_logits)
+                base_result["signal_probabilities"] = str(signal.signal_probabilities)
+
+                if realized_return is None:
+                    base_result["skipped_reason"] = "price_fetch_failed"
+                    results.append(base_result)
+                    continue
+
+                position = _position_from_direction(signal.direction)
+                strategy_return = position * realized_return
+
+                base_result["realized_return"] = realized_return
+                base_result["position"] = position
+                base_result["strategy_return"] = strategy_return
                 results.append(base_result)
-                continue
 
-            position = _position_from_direction(signal.direction)
-            strategy_return = position * realized_return
-
-            base_result["signal_direction"] = signal.direction
-            base_result["signal_confidence"] = signal.confidence
-            base_result["signal_strategy_tag"] = signal.strategy_tag
-            base_result["realized_return"] = realized_return
-            base_result["position"] = position
-            base_result["strategy_return"] = strategy_return
-            results.append(base_result)
-        except Exception as exc:
-            logger.exception("Failed to process backtest row %d: %s", idx, exc)
-            if not base_result["skipped_reason"]:
-                base_result["skipped_reason"] = "signal_failed"
-            results.append(base_result)
+            except Exception as exc:
+                global_idx = batch_start + j + 1
+                logger.exception(
+                    "Failed to assemble result for row %d: %s", global_idx, exc
+                )
+                if not base_result["skipped_reason"]:
+                    base_result["skipped_reason"] = "signal_failed"
+                results.append(base_result)
 
     results_df = pd.DataFrame(results)
     out_dir = os.path.dirname(output_path)

@@ -53,6 +53,26 @@ FINNHUB_MAX_RETRIES: int = int(os.getenv("FINNHUB_MAX_RETRIES", "3"))
 FINNHUB_RETRY_BASE_DELAY_SEC: float = float(os.getenv("FINNHUB_RETRY_BASE_DELAY_SEC", "0.5"))
 
 # ---------------------------------------------------------------------------
+# Logits-based inference settings
+# ---------------------------------------------------------------------------
+
+# Temperature for calibrating softmax probabilities computed from LLM-reported logits.
+# Values > 1 soften the distribution (less confident); values < 1 sharpen it.
+# Applied after softmax: probs_calibrated = softmax(logits / CALIBRATION_T).
+CALIBRATION_T: float = float(os.getenv("FINGPT_CALIBRATION_T", "1.2"))
+
+# Ordered list of sentiment classes for Agent 1.  Order is fixed and must match
+# the order the prompt instructs the model to use.
+SENTIMENT_CLASSES: list[str] = ["POSITIVE", "NEGATIVE", "NEUTRAL"]
+
+# Ordered list of trading strategies for Agent 2.  Maps index → direction:
+#   BUY → long,  HOLD → neutral,  SELL → short.
+STRATEGY_SET: list[str] = ["BUY", "HOLD", "SELL"]
+
+# Max tokens for CoT + logits generation (must accommodate <think> block).
+LOGITS_MAX_TOKENS: int = int(os.getenv("FINGPT_LOGITS_MAX_TOKENS", "1024"))
+
+# ---------------------------------------------------------------------------
 # Logging / output paths
 # ---------------------------------------------------------------------------
 LOGS_DIR: str = "logs"

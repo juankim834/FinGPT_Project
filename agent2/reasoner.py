@@ -1,9 +1,22 @@
-# Required change: switched guided decoding import to StructuredOutputParams for vLLM >= 0.12.0.
 """
-agent2/reasoner.py — Agent 2 vLLM reasoner.
+agent2/reasoner.py — Agent 2: logits-based trading strategy reasoner.
 
-Converts a NewsFingerprint into a TradingSignal using a locally loaded
-DeepSeek model. Raw reasoning text is persisted to logs/cot_<ticker>_<timestamp>.txt.
+The LLM performs chain-of-thought reasoning about the news and Agent 1's
+sentiment, then emits a compact JSON object with self-reported logits for the
+three strategies BUY, HOLD, SELL.
+
+All decision logic is handled deterministically in Python:
+  probs   = softmax(logits / CALIBRATION_T)
+  choice  = STRATEGY_SET[argmax(probs)]          # "BUY" | "HOLD" | "SELL"
+  direction = _STRATEGY_DIRECTION[choice]         # "long" | "neutral" | "short"
+  confidence = max(probs)
+
+The TradingSignal.cot field is populated from the <think>…</think> block
+extracted from the model output, preserving the reasoning audit trail.
+
+Strict mode: if the model output cannot be parsed as JSON containing a
+"logits" field of length len(STRATEGY_SET), generate_signal() returns None
+and writes a diagnostic markdown file.
 """
 
 import json
@@ -15,29 +28,49 @@ from hashlib import md5
 from typing import Any, Optional
 
 from config import (
+    CALIBRATION_T,
     FINGPT_MODEL_PATH,
     LOG_LEVEL,
+    LOGITS_MAX_TOKENS,
     LOGS_DIR,
     SHARE_SINGLE_LLM_BETWEEN_AGENTS,
+    STRATEGY_SET,
 )
 from agent1.schema import NewsFingerprint
-from agent2.prompt import SYSTEM_PROMPT
+from agent2.prompt import STRATEGY_COT_PROMPT
 from agent2.schema import TradingSignal
+from vllm_logits_client import get_choice_logits, get_choice_logits_batch, softmax
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 _DIAG_MD_DIR_ENV = "FINGPT_DIAG_MD_DIR"
 _SPECIAL_TOKEN_RE = re.compile(
     r"(<\|[^>]+\|>|<｜[^｜]+｜>|<s>|</s>|\[INST\]|\[/INST\])"
 )
 _THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 
+# Maps the selected strategy to the TradingSignal direction.
+_STRATEGY_DIRECTION: dict[str, str] = {
+    "BUY": "long",
+    "HOLD": "neutral",
+    "SELL": "short",
+}
+
+# Maps the selected strategy to a strategy_tag value.
+_STRATEGY_TAG: dict[str, str] = {
+    "BUY": "event_driven",
+    "HOLD": "none",
+    "SELL": "event_driven",
+}
+
 _vllm_engine = None
 _chat_tokenizer = None
 
+
+# ---------------------------------------------------------------------------
+# Engine management
+# ---------------------------------------------------------------------------
 
 def _ensure_chat_tokenizer() -> None:
     global _chat_tokenizer  # noqa: PLW0603
@@ -57,7 +90,7 @@ def _ensure_chat_tokenizer() -> None:
 
 
 def _load_model() -> None:
-    """Lazy-load a vLLM engine once; reuse Agent 1 engine in shared mode."""
+    """Lazy-load a vLLM engine; reuse Agent 1 engine in shared mode."""
     global _vllm_engine, _chat_tokenizer  # noqa: PLW0603
 
     if _vllm_engine is not None:
@@ -87,7 +120,6 @@ def _load_model() -> None:
     from vllm import LLM  # type: ignore
 
     logger.info("Loading Agent 2 vLLM engine from: %s", FINGPT_MODEL_PATH)
-    _ensure_chat_tokenizer()
     _vllm_engine = LLM(
         model=FINGPT_MODEL_PATH,
         trust_remote_code=True,
@@ -107,14 +139,15 @@ def set_shared_vllm_engine(engine) -> None:
     logger.info("Injected shared vLLM engine into Agent 2 reasoner.")
 
 
+# ---------------------------------------------------------------------------
+# Prompt formatting
+# ---------------------------------------------------------------------------
+
 def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
-    """
-    Format prompt using tokenizer chat template (preferred), with fallback.
-    """
+    """Format using tokenizer chat template, with safe fallback."""
     _ensure_chat_tokenizer()
     if _chat_tokenizer is not None and hasattr(_chat_tokenizer, "apply_chat_template"):
         try:
-            # Match evaluation behavior: single user message template path.
             if system_prompt.strip():
                 user_content = f"{system_prompt}\n\n{user_content}"
             messages = [{"role": "user", "content": user_content}]
@@ -133,269 +166,46 @@ def _format_chat_prompt(system_prompt: str, user_content: str) -> str:
     )
 
 
-def _strip_code_fences(text: str) -> str:
-    match = _CODE_FENCE_RE.search(text)
-    return match.group(1).strip() if match else text.strip()
-
-
-def _normalize_generated_text(text: str) -> str:
-    # Decode common tokenized artifacts seen in debug outputs.
-    cleaned = text.replace("Ġ", " ").replace("Ċ", "\n")
-    cleaned = _SPECIAL_TOKEN_RE.sub(" ", cleaned)
-    cleaned = _THINK_TAG_RE.sub(" ", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
-
-    # Keep only structured signal section if chain-of-thought leaks ahead of it.
-    marker_match = re.search(r"(?im)^###\s*signal\b", cleaned)
-    if marker_match:
-        cleaned = cleaned[marker_match.start():].strip()
-    return cleaned
-
-
-def _extract_json_blob(text: str) -> str:
-    cleaned = _strip_code_fences(text)
-    match = _JSON_OBJ_RE.search(cleaned)
-    return match.group(0).strip() if match else cleaned
-
-
-def _extract_balanced_json_blob(text: str) -> str:
-    cleaned = _strip_code_fences(text)
-    start = cleaned.find("{")
-    if start < 0:
-        return ""
-
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(cleaned)):
-        ch = cleaned[i]
-        if escape:
-            escape = False
-            continue
-        if ch == "\\":
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return cleaned[start : i + 1].strip()
-    return ""
-
-
-def _parse_json_signal(raw_text: str) -> dict[str, Any]:
-    primary = _extract_json_blob(raw_text)
-    try:
-        return json.loads(primary)
-    except json.JSONDecodeError:
-        balanced = _extract_balanced_json_blob(raw_text)
-        if balanced:
-            return json.loads(balanced)
-        raise
-
-
-def _parse_markdown_signal(raw_text: str) -> dict[str, Any]:
-    text = _strip_code_fences(raw_text)
-    signal_markers = list(re.finditer(r"(?im)^###\s*signal\b", text))
-    if signal_markers:
-        # Prefer the last complete SIGNAL block when multiple are present.
-        text = text[signal_markers[-1].start():]
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    result: dict[str, Any] = {
-        "ticker": "",
-        "direction": "neutral",
-        "strategy_tag": "none",
-        "confidence": 0.0,
-        "cot": "",
-    }
-
-    def _extract_value(line_text: str) -> str:
-        normalized = line_text.replace("**", "")
-        if normalized.startswith("-"):
-            normalized = normalized[1:].strip()
-        return normalized.split(":", 1)[1].strip() if ":" in normalized else ""
-
-    cot_started = False
-    for line in lines:
-        lower = line.lower()
-        if lower.startswith("### "):
-            continue
-        normalized = line.replace("**", "").strip()
-        if normalized.startswith("-"):
-            normalized = normalized[1:].strip()
-        normalized_lower = normalized.lower()
-
-        if normalized_lower.startswith("ticker:"):
-            result["ticker"] = _extract_value(line)
-            cot_started = False
-            continue
-        if normalized_lower.startswith("direction:"):
-            result["direction"] = _extract_value(line).lower()
-            cot_started = False
-            continue
-        if normalized_lower.startswith("strategy_tag:"):
-            result["strategy_tag"] = _extract_value(line).lower()
-            cot_started = False
-            continue
-        if normalized_lower.startswith("confidence:"):
-            raw_conf = _extract_value(line)
-            raw_conf = raw_conf.replace("%", "").strip()
-            try:
-                conf = float(raw_conf)
-                if conf > 1.0:
-                    conf = conf / 100.0
-                result["confidence"] = conf
-            except ValueError:
-                # Keep default and let schema validation catch if needed.
-                pass
-            cot_started = False
-            continue
-        if normalized_lower.startswith("cot:"):
-            result["cot"] = _extract_value(line)
-            cot_started = True
-            continue
-        if cot_started and not normalized_lower.startswith(("ticker:", "direction:", "strategy_tag:", "confidence:")):
-            # Allow wrapped reasoning lines after `- cot:`.
-            result["cot"] = f"{result['cot']} {line}".strip()
-
-    # Compact single-line fallback:
-    # "### SIGNAL-ticker: X - direction: long - strategy_tag: momentum - confidence: 0.7 - cot: ..."
-    if not result["ticker"] or not result["cot"]:
-        collapsed = " ".join(lines)
-        collapsed = re.sub(r"\s+", " ", collapsed).strip()
-        keys = ["ticker", "direction", "strategy_tag", "confidence", "cot"]
-        key_union = "|".join(keys)
-
-        def _extract(field: str) -> str:
-            pattern = rf"{field}\s*:\s*(.*?)(?=\s+-\s*(?:{key_union})\s*:|$)"
-            match = re.search(pattern, collapsed, flags=re.IGNORECASE)
-            return match.group(1).strip() if match else ""
-
-        ticker = _extract("ticker")
-        direction = _extract("direction").lower()
-        strategy_tag = _extract("strategy_tag").lower()
-        confidence_raw = _extract("confidence").replace("%", "").strip()
-        cot = _extract("cot")
-
-        if ticker:
-            result["ticker"] = ticker
-        if direction:
-            result["direction"] = direction
-        if strategy_tag:
-            result["strategy_tag"] = strategy_tag
-        if confidence_raw:
-            try:
-                conf = float(confidence_raw)
-                if conf > 1.0:
-                    conf = conf / 100.0
-                result["confidence"] = conf
-            except ValueError:
-                pass
-        if cot:
-            result["cot"] = cot
-
-    return result
-
-
-def _parse_signal_structured(raw_text: str) -> dict[str, Any]:
-    try:
-        return _parse_json_signal(raw_text)
-    except Exception:
-        parsed = _parse_markdown_signal(raw_text)
-        if parsed.get("ticker") and parsed.get("cot"):
-            return parsed
-        raise
-
-
-def _parse_signal_fallback(raw_text: str, fingerprint: NewsFingerprint) -> dict[str, Any]:
+def _build_prompt(fingerprint: NewsFingerprint) -> str:
     """
-    Last-resort parser for loosely formatted model outputs.
+    Build the Agent 2 strategy-selection prompt.
+
+    The prompt includes:
+    - Agent 1's sentiment JSON (label, confidence, full probability vector).
+    - The original article text (stored on the fingerprint).
+    - The CoT + logits instructions from STRATEGY_COT_PROMPT.
+
+    Falls back to the fingerprint headline when article_text is empty (e.g.
+    if an older fingerprint was passed that predates the article_text field).
     """
-    text = raw_text.strip()
-    lower = text.lower()
-
-    ticker = fingerprint.companies_named[0] if fingerprint.companies_named else "UNKNOWN"
-
-    direction = "neutral"
-    if re.search(r"\b(long|bullish|buy)\b", lower):
-        direction = "long"
-    elif re.search(r"\b(short|bearish|sell)\b", lower):
-        direction = "short"
-
-    strategy_tag = "none"
-    strategy_patterns = {
-        "momentum": r"\bmomentum\b",
-        "mean_reversion": r"\bmean[\s_-]?reversion\b",
-        "event_driven": r"\bevent[\s_-]?driven\b",
-        "macro": r"\bmacro\b",
+    sentiment_payload = {
+        "sentiment": fingerprint.sentiment_label,
+        "confidence": round(fingerprint.sentiment_confidence, 4),
+        "probabilities": fingerprint.sentiment_probabilities,
     }
-    for tag, pattern in strategy_patterns.items():
-        if re.search(pattern, lower):
-            strategy_tag = tag
-            break
+    sentiment_json = json.dumps(sentiment_payload, indent=2)
 
-    confidence = 0.5
-    conf_match = re.search(r"\bconfidence\b[^0-9]*(\d+(?:\.\d+)?)\s*%?", lower)
-    if conf_match:
-        conf_val = float(conf_match.group(1))
-        confidence = conf_val / 100.0 if conf_val > 1.0 else conf_val
-    confidence = max(0.0, min(1.0, confidence))
-
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    cot = " ".join(sentences[:3]).strip()
-    if not cot:
-        cot = (
-            f"Fallback parse used. Direction={direction}, "
-            f"strategy_tag={strategy_tag}, confidence={confidence:.2f}."
+    article_text = fingerprint.article_text or fingerprint.headline
+    if not article_text:
+        article_text = (
+            f"Headline: {fingerprint.headline}\n"
+            f"Companies: {', '.join(fingerprint.companies_named)}\n"
+            f"Keywords: {', '.join(fingerprint.event_keywords)}"
         )
 
-    return {
-        "ticker": ticker,
-        "direction": direction,
-        "strategy_tag": strategy_tag,
-        "confidence": confidence,
-        "cot": cot,
-    }
-
-
-def _build_prompt(fingerprint: NewsFingerprint) -> str:
-    payload = json.dumps(
-        {
-            "source": fingerprint.source,
-            "published_at": fingerprint.published_at,
-            "headline": fingerprint.headline,
-            "companies_named": fingerprint.companies_named,
-            "event_keywords": fingerprint.event_keywords,
-        },
-        indent=2,
+    user_content = STRATEGY_COT_PROMPT.format(
+        sentiment_json=sentiment_json,
+        article_text=article_text,
     )
-    sentiment_line = (
-        f"Agent 1 assessed this news as {fingerprint.sentiment_label} "
-        f"with a sentiment score of {fingerprint.sentiment_score:.2f} "
-        f"(confidence: {fingerprint.sentiment_confidence:.2f}). "
-        "Based on this and the extracted facts, determine the trading signal."
-    )
-
-    user_content = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"{sentiment_line}\n\n"
-        "NewsFingerprint JSON:\n"
-        f"{payload}"
-    )
-    # Match eval behavior: one user message, formatted by chat template.
     return _format_chat_prompt("", user_content)
 
 
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
 def _log_thinking(thinking_text: str, ticker: str) -> None:
-    """Persist reasoning text to logs/cot_<ticker>_<timestamp>.txt."""
+    """Persist chain-of-thought reasoning to logs/cot_<ticker>_<timestamp>.txt."""
     os.makedirs(LOGS_DIR, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     filename = os.path.join(LOGS_DIR, f"cot_{ticker}_{timestamp}.txt")
@@ -410,81 +220,210 @@ def _save_md_debug_output(
     attempt_idx: int,
     token_budget: int,
 ) -> None:
-    """
-    Persist raw signal-generation output for debugging in markdown files.
-    """
+    """Persist raw signal-generation output for debugging."""
     try:
         base_dir = os.getenv(_DIAG_MD_DIR_ENV, "output/diagnostics_md")
         out_dir = os.path.join(base_dir, "agent2")
         os.makedirs(out_dir, exist_ok=True)
 
-        identity = f"{fingerprint.headline}|{fingerprint.companies_named[0] if fingerprint.companies_named else ''}"
+        identity = (
+            f"{fingerprint.headline}|"
+            f"{fingerprint.companies_named[0] if fingerprint.companies_named else ''}"
+        )
         fp_id = md5(identity.encode("utf-8")).hexdigest()[:12]
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        filename = f"{timestamp}_a2_{fp_id}_attempt{attempt_idx}_tok{token_budget}.md"
+        filename = (
+            f"{timestamp}_a2_{fp_id}_attempt{attempt_idx}_tok{token_budget}.md"
+        )
         out_path = os.path.join(out_dir, filename)
 
         with open(out_path, "w", encoding="utf-8") as handle:
             handle.write(raw_output)
-        logger.info("Saved Agent 2 markdown debug output to %s", out_path)
+        logger.info("Saved Agent 2 debug output to %s", out_path)
     except Exception as exc:
-        logger.warning("Failed to save Agent 2 markdown debug output: %s", exc)
+        logger.warning("Failed to save Agent 2 debug output: %s", exc)
+
+
+def _save_failure_diagnostic(fingerprint: NewsFingerprint, raw_output: str) -> None:
+    """Write a diagnostic file when logits JSON parsing fails (strict mode)."""
+    try:
+        base_dir = os.getenv(_DIAG_MD_DIR_ENV, "output/diagnostics_md")
+        out_dir = os.path.join(base_dir, "agent2_failures")
+        os.makedirs(out_dir, exist_ok=True)
+
+        identity = (
+            f"{fingerprint.headline}|"
+            f"{fingerprint.companies_named[0] if fingerprint.companies_named else 'UNKNOWN'}"
+        )
+        fp_id = md5(identity.encode("utf-8")).hexdigest()[:12]
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"{timestamp}_a2_FAILURE_{fp_id}.md"
+        out_path = os.path.join(out_dir, filename)
+
+        with open(out_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                f"# Agent 2 logits parse failure\n\n"
+                f"**Headline:** {fingerprint.headline}\n\n"
+                f"**Companies:** {fingerprint.companies_named}\n\n"
+                f"**Expected choices:** {STRATEGY_SET}\n\n"
+                f"## Raw model output\n\n```\n{raw_output}\n```\n"
+            )
+        logger.warning("Failure diagnostic written to %s", out_path)
+    except Exception as exc:
+        logger.warning("Could not write failure diagnostic: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal post-processing (shared by single-item and batch paths)
+# ---------------------------------------------------------------------------
+
+def _process_signal_result(
+    fingerprint: NewsFingerprint,
+    result: dict,
+) -> Optional[TradingSignal]:
+    """
+    Convert a ``get_choice_logits`` / ``get_choice_logits_batch`` result dict
+    into a ``TradingSignal``.
+
+    This function contains **all** output logic: softmax, argmax, direction
+    mapping, strategy tag, confidence, CoT extraction, and the diagnostic
+    failure path.  It is called identically by ``generate_signal`` (single-item)
+    and ``generate_signal_batch``.
+
+    Returns ``None`` on parse failure (strict mode) or validation error.
+    """
+    if not result["parse_success"] or result["logits"] is None:
+        logger.error(
+            "Agent 2 logits parse failed for headline: %s", fingerprint.headline
+        )
+        _save_failure_diagnostic(fingerprint, result["raw_output"])
+        return None
+
+    logits: list[float] = result["logits"]
+
+    probs = softmax(logits, temperature=CALIBRATION_T)
+    best_idx = probs.index(max(probs))
+    strategy: str = STRATEGY_SET[best_idx]
+    confidence: float = probs[best_idx]
+    probabilities = dict(zip(STRATEGY_SET, probs))
+
+    direction: str = _STRATEGY_DIRECTION[strategy]
+    strategy_tag: str = _STRATEGY_TAG[strategy]
+
+    logger.info(
+        "Agent 2 logits=%s  probs=%s  strategy=%s  dir=%s  conf=%.4f",
+        logits,
+        [f"{p:.4f}" for p in probs],
+        strategy,
+        direction,
+        confidence,
+    )
+
+    thinking_text = result.get("thinking", "").strip()
+    ticker = fingerprint.companies_named[0] if fingerprint.companies_named else "UNKNOWN"
+
+    if thinking_text:
+        _log_thinking(thinking_text, ticker)
+    else:
+        _log_thinking(
+            f"strategy={strategy}; direction={direction}; "
+            f"confidence={confidence:.4f}; logits={logits}",
+            ticker,
+        )
+
+    return TradingSignal(
+        ticker=ticker,
+        direction=direction,  # type: ignore[arg-type]
+        strategy_tag=strategy_tag,  # type: ignore[arg-type]
+        confidence=round(confidence, 6),
+        cot=thinking_text or f"Strategy: {strategy}. Logits: {logits}.",
+        signal_logits=logits,
+        signal_probabilities={k: round(v, 6) for k, v in probabilities.items()},
+        calibration_T=CALIBRATION_T,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+def generate_signal_batch(
+    fingerprints: list[NewsFingerprint],
+) -> list[Optional[TradingSignal]]:
+    """
+    Batch version of ``generate_signal``.
+
+    Sends all strategy-selection prompts to vLLM in a **single**
+    ``engine.generate()`` call, then processes each result independently with
+    the same output logic as the single-item path (via ``_process_signal_result``).
+
+    Returns a list of the same length as *fingerprints*.  Items are ``None``
+    wherever logits parsing fails (strict mode) or a ``TradingSignal`` validation
+    error occurs.
+    """
+    _load_model()
+
+    if not fingerprints:
+        return []
+
+    prompts = [_build_prompt(fp) for fp in fingerprints]
+
+    results = get_choice_logits_batch(
+        engine=_vllm_engine,
+        prompts=prompts,
+        choices=STRATEGY_SET,
+        max_tokens=LOGITS_MAX_TOKENS,
+        temperature=0.0,
+    )
+
+    signals: list[Optional[TradingSignal]] = []
+    for i, (fingerprint, result) in enumerate(zip(fingerprints, results)):
+        _save_md_debug_output(fingerprint, result["raw_output"], i + 1, LOGITS_MAX_TOKENS)
+        logger.info(
+            "Batch signal[%d] raw output (first 300 chars): %s",
+            i,
+            result["raw_output"][:300],
+        )
+        try:
+            signals.append(_process_signal_result(fingerprint, result))
+        except Exception as exc:
+            logger.error(
+                "generate_signal_batch[%d] failed: %s", i, exc, exc_info=True
+            )
+            signals.append(None)
+
+    return signals
 
 
 def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
     """
-    Run vLLM inference to generate and validate a TradingSignal.
+    Run logits-based vLLM inference to produce a TradingSignal (single-item).
 
-    Returns None on any model, parse, IO, or validation failure.
+    Strategy selection and confidence are computed deterministically from the
+    logits JSON the model emits — the LLM never outputs the final label.
+    Output logic is fully delegated to ``_process_signal_result``.
+
+    Returns None on any model, parse, or validation failure (strict mode).
     """
     try:
         _load_model()
-        from vllm import SamplingParams  # type: ignore
 
         prompt = _build_prompt(fingerprint)
-        signal_schema = TradingSignal.model_json_schema()
-        params_kwargs: dict[str, Any] = {
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "top_p": 1.0,
-        }
-        try:
-            from vllm.sampling_params import StructuredOutputParams  # type: ignore
-
-            params_kwargs["guided_decoding"] = StructuredOutputParams(json=signal_schema)
-        except ImportError:
-            logger.warning(
-                "Structured output params unavailable in current vLLM version; "
-                "falling back to non-guided signal generation."
-            )
-
-        params = SamplingParams(**params_kwargs)
-        outputs = _vllm_engine.generate([prompt], params)
-        raw_text = outputs[0].outputs[0].text.strip() if outputs and outputs[0].outputs else ""
-        clean_text = _normalize_generated_text(raw_text)
-        _save_md_debug_output(fingerprint, clean_text, 1, 256)
-        logger.info(
-            "Agent 2 raw output (attempt %d, max_tokens=%d): %s",
-            1,
-            256,
-            clean_text[:300],
+        result = get_choice_logits(
+            engine=_vllm_engine,
+            prompt=prompt,
+            choices=STRATEGY_SET,
+            max_tokens=LOGITS_MAX_TOKENS,
+            temperature=0.0,
         )
 
-        parsed = _parse_signal_structured(clean_text)
+        _save_md_debug_output(fingerprint, result["raw_output"], 1, LOGITS_MAX_TOKENS)
+        logger.info(
+            "Agent 2 raw output (first 300 chars): %s",
+            result["raw_output"][:300],
+        )
 
-        signal = TradingSignal(**parsed)
-
-        reasoning_text = parsed.get("cot", "").strip() if isinstance(parsed, dict) else ""
-        if reasoning_text:
-            _log_thinking(reasoning_text, signal.ticker)
-        else:
-            fallback = (
-                f"direction={signal.direction}; strategy_tag={signal.strategy_tag}; "
-                f"confidence={signal.confidence:.2f}; no cot field content returned."
-            )
-            _log_thinking(fallback, signal.ticker)
-
-        return signal
+        return _process_signal_result(fingerprint, result)
 
     except Exception as exc:
         logger.error("generate_signal failed: %s", exc, exc_info=True)

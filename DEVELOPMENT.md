@@ -1,62 +1,49 @@
 # FinGPT Two-Agent Signal Pipeline — Development Guide
 
-## Current Summary
+## Current State
 
-- Both agents now run **locally with HuggingFace** (`deepseek-ai/DeepSeek-R1-Distill-Llama-8B`). 
-- `agent1` extracts factual `NewsFingerprint` fields and computes sentiment via **token log-prob candidate scoring**.
-- `agent2` consumes the fingerprint + Agent 1 sentiment and outputs validated `TradingSignal` JSON with `confidence` and `cot`.
-- Added evaluation utilities under `evaluation/`:
-  - `collect_batch.py` to build held-out datasets
-  - `evaluator.py` for directional accuracy, calibration, and self-consistency
-- `notebooks/demo.ipynb` was rewritten for **Google Colab A100** workflow.
-
----
-
-## 1) Project Overview
-
-This project converts financial news into trading signals using a two-agent pipeline:
-
-1. `ingestion/news_fetcher.py` fetches articles from Alpaca News.
-2. `agent1/extractor.py` turns raw article text into a `NewsFingerprint`.
-3. `agent2/reasoner.py` turns that fingerprint into a `TradingSignal`.
-4. `pipeline.py` orchestrates the flow and saves results to `output/`.
-
-The pipeline is serial, skip-on-failure, and designed for robust batch processing.
+- Inference runs on local vLLM using DeepSeek-R1-Distill-Llama-8B.
+- Agent 1 extracts `NewsFingerprint` + sentiment.
+- Agent 2 converts fingerprint into `TradingSignal`.
+- Backtest mode is first-class and uses:
+  - Hugging Face dataset loading (`FinGPT/fingpt-forecaster-dow30-202305-202405`)
+  - yfinance realized returns
+  - strict skip-on-failure behavior
+- Colab notebook is backtest-only after setup cells.
 
 ---
 
-## 2) Architecture
+## 1) Architecture (Current)
+
+### Backtest Path (Primary)
 
 ```
-Alpaca News API
-   ↓
+HF dataset / local parquet-csv
+  -> backtest/dataset_parser.py
+  -> agent1/extractor.py
+  -> agent2/reasoner.py
+  -> backtest/price_fetcher.py
+  -> backtest/backtester.py
+  -> output/backtest_results*.csv + metrics
+```
+
+### Live News Path (Optional)
+
+```
 ingestion/news_fetcher.py
-   ↓  list[article dict]
-agent1/extractor.py (local HF model)
-   ↓  NewsFingerprint
-agent2/reasoner.py  (local HF model)
-   ↓  TradingSignal
-pipeline.py
-   ↓
-output/signals_<timestamp>.json
-```
-
-Evaluation and batch utilities:
-
-```
-evaluation/collect_batch.py   -> output/held_out_batch_<timestamp>.json
-evaluation/evaluator.py       -> output/evaluation_<timestamp>.json
+  -> agent1/extractor.py
+  -> agent2/reasoner.py
+  -> pipeline.py
 ```
 
 ---
 
-## 3) Repository Structure (Key Files)
+## 2) Key Files
 
 ```
 FinGPT_Part2/
 ├── config.py
 ├── pipeline.py
-├── ingestion/news_fetcher.py
 ├── agent1/
 │   ├── extractor.py
 │   ├── prompt.py
@@ -65,174 +52,195 @@ FinGPT_Part2/
 │   ├── reasoner.py
 │   ├── prompt.py
 │   └── schema.py
-├── evaluation/
+├── backtest/
 │   ├── __init__.py
-│   ├── collect_batch.py
-│   └── evaluator.py
+│   ├── dataset_parser.py
+│   ├── price_fetcher.py
+│   ├── backtester.py
+│   └── run_backtest.py
+├── ingestion/news_fetcher.py
 ├── notebooks/demo.ipynb
-└── backtest/runner.py
+└── DEVELOPMENT.md
 ```
 
 ---
 
-## 4) Data Models
+## 3) Model and Prompt Constraints
 
-### `agent1/schema.py` — `NewsFingerprint`
-
-```python
-class NewsFingerprint(BaseModel):
-    source: str
-    published_at: str
-    headline: str
-    companies_named: list[str]
-    event_keywords: list[str]
-    sentiment_label: Literal[
-        "strongly bullish", "bullish", "neutral", "bearish", "strongly bearish"
-    ]
-    sentiment_score: float         # expected value in [-2, 2]
-    sentiment_confidence: float    # max class probability in [0, 1]
-```
-
-### `agent2/schema.py` — `TradingSignal`
-
-```python
-class TradingSignal(BaseModel):
-    ticker: str
-    direction: Literal["long", "short", "neutral"]
-    strategy_tag: Literal["momentum", "mean_reversion", "event_driven", "macro", "none"]
-    confidence: float
-    cot: str
-```
+- Use vLLM structured decoding via `StructuredOutputParams`.
+- Do not use `GuidedDecodingParams`.
+- Prompts are user-turn only (no system-role dependency).
+- Prompts use direct task instructions (no persona framing).
+- Agent 1 and Agent 2 prompts include compact "good output" JSON examples.
 
 ---
 
-## 5) Agent Details
+## 4) Agent Behavior
 
-## Agent 1 (`agent1/extractor.py`)
+### Agent 1 (`agent1/extractor.py`)
 
-- Lazy-loads tokenizer/model once (`_load_model`).
-- Uses local HF model path/id from `FINGPT_MODEL_PATH`.
-- Uses `bfloat16` on CUDA (`float32` on CPU fallback).
-- Produces structured extraction + sentiment outputs.
-- Sentiment method:
-  - fixed label set (5 classes),
-  - candidate sequence log-prob scores,
-  - softmax probabilities,
-  - expected-value score in `[-2, 2]`.
+- `extract_fingerprint(article_text) -> Optional[NewsFingerprint]`
+- Structured extraction + separate sentiment classification.
+- Uses shared/injected vLLM engine when available.
+- Loader now reuses injected engine even if tokenizer is not yet ready.
 
-Public API:
+### Agent 2 (`agent2/reasoner.py`)
 
-```python
-extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]
-```
-
-## Agent 2 (`agent2/reasoner.py`)
-
-- Fully local HF inference (Anthropic path removed).
-- Separate model instance from Agent 1 (separate module-level lazy load).
-- Prompt explicitly includes Agent 1 sentiment text.
-- Expects strict JSON output and validates via `TradingSignal`.
-- Logs reasoning text to `logs/cot_<ticker>_<timestamp>.txt`.
-
-Public API:
-
-```python
-generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]
-```
+- `generate_signal(fingerprint) -> Optional[TradingSignal]`
+- Structured output expected and validated by `TradingSignal`.
+- Strict mode: if structured parse fails, returns `None` (no permissive fallback signal).
+- Saves raw diagnostic markdown output for each generation attempt.
 
 ---
 
-## 6) Pipeline Usage
+## 5) Backtest Data Parsing Notes
 
-CLI:
+`backtest/dataset_parser.py` supports:
+
+- Local `.parquet`
+- Local `.csv`
+- Hugging Face dataset IDs
+
+HF split selection priority:
+
+1. `test`
+2. `validation`
+3. `train`
+4. first available split
+
+Multi-headline prompt handling:
+
+- Extracts `[Headline]` + `[Summary]` pairs.
+- Preserves structure as numbered news blocks in `article_text`.
+
+Duplicate column safety:
+
+- Handles duplicate labels / `Series` values from HF->pandas conversion.
+- Avoids ambiguous truth-value errors in row parsing.
+
+---
+
+## 6) Price Fetching and Caching
+
+`backtest/price_fetcher.py` caches realized returns:
+
+- In-memory cache for current process.
+- Persistent disk cache JSON for cross-run reuse.
+
+Cache path:
+
+- Env var `FINGPT_YF_CACHE_PATH`, default `output/yfinance_return_cache.json`
+
+Useful helper:
+
+- `get_cache_stats()` returns memory and disk cache counts.
+
+---
+
+## 7) Colab Reload and Runtime Hygiene
+
+After changing local project Python files in Colab Drive mounts, reload modules:
+
+```python
+import importlib
+import agent1.prompt as p1, agent1.extractor as e1
+import agent2.prompt as p2, agent2.reasoner as r2
+import backtest.dataset_parser as dp
+import backtest.price_fetcher as pf
+import backtest.backtester as bt
+
+for m in [p1, e1, p2, r2, dp, pf, bt]:
+    importlib.reload(m)
+```
+
+If behavior still looks stale:
+
+- Restart runtime and rerun from setup cells.
+
+---
+
+## 8) Troubleshooting Playbook
+
+### A) `ValueError: Unsupported dataset format. Use .parquet or .csv`
+
+Cause:
+
+- Old `dataset_parser` module still loaded in notebook kernel.
+
+Fix:
+
+1. Reload `backtest.dataset_parser`.
+2. Verify `print(dp.__file__)` points to intended repo path.
+
+### B) `ValueError: The truth value of a Series is ambiguous`
+
+Cause:
+
+- HF->pandas row value is `Series` (duplicate labels), not scalar.
+
+Fix:
+
+- Use current parser code that normalizes duplicate columns and safe row extraction.
+
+### C) Agent 2 outputs free-form reasoning, not JSON
+
+Symptoms:
+
+- Diagnostic `.md` starts with natural language reasoning.
+
+Cause:
+
+- Structured generation not enforced at runtime for that call, or model drift.
+
+Current behavior:
+
+- Agent 2 strict mode now fails row as `signal_failed` instead of manufacturing fallback signal.
+
+Actions:
+
+1. Confirm `StructuredOutputParams` path is active.
+2. Reload `agent2.reasoner` and `agent2.prompt`.
+3. Increase `max_tokens` if truncation suspected.
+4. Inspect diagnostics in `FINGPT_DIAG_MD_DIR/agent2`.
+
+### D) vLLM engine init crash (`Engine core initialization failed`)
+
+Typical trigger:
+
+- Agent attempts to spawn a second engine in constrained Colab/GPU state.
+
+Current mitigation:
+
+- Both agents reuse injected shared engine if present.
+- Loader returns early when engine exists.
+
+Actions:
+
+1. Ensure shared engine injection cell was run.
+2. Reload agent modules.
+3. Restart runtime if a stale crashed engine process remains.
+
+---
+
+## 9) Operational Recommendations
+
+- Keep backtest notebook on test split by default.
+- Keep strict parse behavior in Agent 2 to avoid hidden bad generations.
+- Keep diagnostics markdown enabled in non-production runs.
+- Track skip reasons (`fingerprint_failed`, `signal_failed`, `price_fetch_failed`) as health signals.
+
+---
+
+## 10) Quick Commands
+
+Run backtest from CLI:
 
 ```bash
-python pipeline.py
-python pipeline.py AAPL NVDA TSLA
+python -m backtest.run_backtest --dataset "FinGPT/fingpt-forecaster-dow30-202305-202405" --metrics
 ```
 
-Python:
-
-```python
-from pipeline import run_pipeline
-signals = run_pipeline(["AAPL", "NVDA"], limit=10)
-```
-
-Output:
-
-- `output/signals_<timestamp>.json` (list of `TradingSignal` dicts)
-
----
-
-## 7) Evaluation Utilities
-
-## `evaluation/collect_batch.py`
-
-Builds held-out datasets by running full pipeline per article:
-
-- Fetches up to 100 Alpaca articles (default ticker basket).
-- Runs Agent 1 -> Agent 2 per item.
-- Saves successful records to:
-  - `output/held_out_batch_<timestamp>.json`
-- Logs skip reasons (`Agent 1 failed` / `Agent 2 failed`).
-
-CLI:
+Run subset:
 
 ```bash
-python evaluation/collect_batch.py
+python -m backtest.run_backtest --dataset "FinGPT/fingpt-forecaster-dow30-202305-202405" --max-rows 50 --metrics
 ```
-
-## `evaluation/evaluator.py`
-
-Provides:
-
-- `evaluate_directional_accuracy(signals)`
-- `evaluate_calibration(signals)`
-- `evaluate_self_consistency(articles, n_runs=3)`
-- `run_full_evaluation(signals_file)`
-
-Saves:
-
-- `output/evaluation_<timestamp>.json`
-
-CLI:
-
-```bash
-python -m evaluation.evaluator output/signals_XYZ.json
-```
-
----
-
-## 8) Colab Notebook
-
-`notebooks/demo.ipynb` is now Colab-oriented:
-
-- Declares A100/40GB requirement.
-- Installs dependencies in-notebook.
-- Loads Alpaca credentials via `google.colab.userdata.get`.
-- Uses HF Hub model id (`deepseek-ai/DeepSeek-R1-Distill-Llama-8B`).
-- Shows VRAM before/after loading both agents.
-- Runs fetch -> Agent 1 -> Agent 2 -> DataFrame -> mini self-consistency -> save.
-- Uses `tqdm` in loops.
-
----
-
-## 9) Configuration Notes
-
-`config.py` still contains some legacy Claude constants (`ANTHROPIC_API_KEY`, `CLAUDE_*`) that are not used by the rewritten local Agent 2 path.
-
-Active variables for core flow:
-
-- `FINGPT_MODEL_PATH`
-- `ALPACA_API_KEY`
-- `ALPACA_API_SECRET`
-- `LOG_LEVEL`, `OUTPUT_DIR`, `LOGS_DIR`
-
----
-
-## 10) Known Gaps / Next Improvements
-
-- Add/refresh tests for new Agent 2 local path and evaluation modules.
-- Consider adding retry/backoff for Alpaca and yfinance calls.
-- Consider stronger JSON schema enforcement in prompts (and optional repair pass).
-- Consider caching fetched market data during evaluation to reduce API overhead.
