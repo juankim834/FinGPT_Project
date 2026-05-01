@@ -1,22 +1,35 @@
 """
 agent1/prompt.py — Prompts for Agent 1.
 
-Two separate prompts are used:
+Two prompts are used:
 
-1. EXTRACTION_PROMPT  — instructs the model to extract structured facts from
-   the article and return them as a JSON object.  Guided decoding enforces the
-   NewsFingerprint schema so no CoT is needed here.
+EXTRACTION_PROMPT
+    Instructs the model to extract structured facts from the article and
+    return them as a JSON object.  Guided decoding enforces the schema.
+    Unchanged from previous version.
 
-2. SENTIMENT_COT_PROMPT — instructs the DeepSeek-R1 model to:
-     Step 1: Reason inside <think>…</think> about the sentiment.
-     Step 2: Output a compact JSON object with self-reported logits for the
-             three sentiment classes in a fixed order (POSITIVE, NEGATIVE, NEUTRAL).
-   All probability calculations (softmax, calibration, argmax) are done
-   deterministically in Python after the LLM returns these logits.
+SENTIMENT_COT_PROMPT
+    Instructs the DeepSeek-R1 model to write chain-of-thought reasoning
+    about the article's market sentiment inside ``<think>…</think>`` tags.
+    The model stops at ``</think>`` (via vLLM ``stop=["</think>"]``).
+
+    The scoring phase in ``vllm_logits_client.get_real_choice_logits``
+    then appends ``</think>\\n`` + ``SENTIMENT_DECISION_PREFIX`` and reads
+    the model's genuine token-level log-probabilities for each class label
+    (POSITIVE, NEGATIVE, NEUTRAL) via ``SamplingParams(prompt_logprobs=1)``.
+
+    The model is NOT asked to output logit numbers or a JSON object.  All
+    probability calculations happen in Python from the real model logprobs.
+
+SENTIMENT_DECISION_PREFIX
+    Short string appended after the CoT to create the decision context.
+    The model's next-token distribution at this point is scored for each
+    choice label.  Must end with a space so the choice token attaches
+    cleanly (e.g. "Sentiment: POSITIVE").
 """
 
 # ---------------------------------------------------------------------------
-# Fact-extraction prompt (unchanged from previous version)
+# Fact-extraction prompt (guided decoding — unchanged)
 # ---------------------------------------------------------------------------
 
 EXTRACTION_PROMPT: str = (
@@ -34,49 +47,31 @@ EXTRACTION_PROMPT: str = (
     "- event_keywords: list of lowercase topic keywords"
 )
 
-# Keep old name as alias so any external imports still resolve.
+# Backward-compatible alias.
 SYSTEM_PROMPT: str = EXTRACTION_PROMPT
 
 # ---------------------------------------------------------------------------
-# Sentiment CoT + logits prompt
+# Sentiment CoT prompt (Phase 1 — reasoning only, no answer expected)
 # ---------------------------------------------------------------------------
 
 SENTIMENT_COT_PROMPT: str = """\
 You are a financial news sentiment analyst.
 
-Your task has two steps:
+Reason step by step about the market sentiment conveyed by the following \
+article. Write your analysis inside <think>...</think> tags. Consider:
 
-Step 1 — Reasoning (write inside <think> tags):
-Analyse the news article carefully.  Consider:
-  • Which companies or sectors are affected?
-  • Is the news fundamentally positive, negative, or neutral for investors?
-  • Are there any conflicting signals or ambiguity?
-Write your reasoning inside <think> and </think> tags.
+• Which companies or sectors are mentioned and how are they affected?
+• Is the news fundamentally positive, negative, or neutral for investors?
+• Are there conflicting signals or ambiguity in the article?
 
-Step 2 — Final output (after the </think> tag):
-Output a single JSON object containing the raw logit scores for exactly three
-sentiment classes in this fixed order: POSITIVE, NEGATIVE, NEUTRAL.
-
-Rules:
-  • Do NOT output a sentiment label, probability, or any text outside the JSON.
-  • The logit values are unscaled real numbers (positive or negative).
-  • Higher logit → stronger belief in that class.
-  • The JSON must have exactly one key: "logits", whose value is a list of
-    three numbers.
-
-Few-shot example
-----------------
-Article: "Company X beats earnings estimates by 15%; CEO raises full-year guidance."
-
-<think>
-The article reports a strong earnings beat and positive guidance revision.
-This is clearly good news for investors.  Sentiment should be strongly positive.
-NEGATIVE and NEUTRAL logits should be much lower.
-</think>
-{"logits": [2.8, -1.2, 0.1]}
-
-----------------
-Now analyse the following article:
-
-{article_text}
+{article_text}\
 """
+
+# ---------------------------------------------------------------------------
+# Decision prefix (Phase 2 — appended after </think> for logprob scoring)
+# ---------------------------------------------------------------------------
+
+# The model's next-token distribution at "Sentiment: " is scored for each
+# of the three class labels: POSITIVE, NEGATIVE, NEUTRAL.
+# Must end with a space so the choice token aligns with BPE tokenisation.
+SENTIMENT_DECISION_PREFIX: str = "Sentiment: "

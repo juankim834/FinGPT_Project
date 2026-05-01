@@ -29,9 +29,17 @@ from config import (
     LOGITS_MAX_TOKENS,
     SENTIMENT_CLASSES,
 )
-from agent1.prompt import EXTRACTION_PROMPT, SENTIMENT_COT_PROMPT
+from agent1.prompt import (
+    EXTRACTION_PROMPT,
+    SENTIMENT_COT_PROMPT,
+    SENTIMENT_DECISION_PREFIX,
+)
 from agent1.schema import NewsFingerprint, SentimentLabel, _SENTIMENT_SCORE
-from vllm_logits_client import get_choice_logits, get_choice_logits_batch, softmax
+from vllm_logits_client import (
+    get_real_choice_logits,
+    get_real_choice_logits_batch,
+    softmax,
+)
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -448,19 +456,31 @@ def _process_sentiment_result(
 
 def _score_sentiment(article_text: str) -> dict[str, Any]:
     """
-    Run a single CoT vLLM call and return the sentiment sub-dict.
+    Extract real model log-probabilities for each sentiment class.
+
+    Two vLLM calls (handled inside get_real_choice_logits):
+      Phase 1 — CoT generation (stop at </think>).
+      Phase 2 — prompt_logprobs scoring of POSITIVE / NEGATIVE / NEUTRAL.
+
     Output logic is fully delegated to ``_process_sentiment_result``.
     """
     _ensure_chat_tokenizer()
-    sentiment_user_content = SENTIMENT_COT_PROMPT.format(article_text=article_text)
-    prompt = _format_chat_prompt("", sentiment_user_content)
+    if _chat_tokenizer is None:
+        raise RuntimeError(
+            "Tokenizer not loaded — cannot compute real choice logprobs. "
+            "Ensure FINGPT_MODEL_PATH is set before calling extract_fingerprint."
+        )
 
-    result = get_choice_logits(
+    cot_user_content = SENTIMENT_COT_PROMPT.format(article_text=article_text)
+    cot_prompt = _format_chat_prompt("", cot_user_content)
+
+    result = get_real_choice_logits(
         engine=_vllm_engine,
-        prompt=prompt,
+        cot_prompt=cot_prompt,
         choices=SENTIMENT_CLASSES,
-        max_tokens=LOGITS_MAX_TOKENS,
-        temperature=0.0,
+        decision_prefix=SENTIMENT_DECISION_PREFIX,
+        tokenizer=_chat_tokenizer,
+        max_cot_tokens=LOGITS_MAX_TOKENS,
     )
     return _process_sentiment_result(result, article_text)
 
@@ -521,13 +541,19 @@ def extract_fingerprint_batch(
     _load_model()
     _ensure_chat_tokenizer()
 
+    if _chat_tokenizer is None:
+        raise RuntimeError(
+            "Tokenizer not loaded — cannot compute real choice logprobs. "
+            "Ensure FINGPT_MODEL_PATH is set before calling extract_fingerprint_batch."
+        )
+
     n = len(article_texts)
     if n == 0:
         return []
 
     from vllm import SamplingParams  # type: ignore
 
-    # --- Step 1: Batch guided fact extraction ---
+    # --- Step 1: Batch guided fact extraction (1 vLLM call) ---
     extraction_prompts = [_build_extraction_prompt(t) for t in article_texts]
     guided_schema = _build_guided_extraction_schema()
     ext_params_kwargs: dict[str, Any] = {"max_tokens": 2048, "temperature": 0.0}
@@ -544,17 +570,20 @@ def extract_fingerprint_batch(
         o.outputs[0].text if o.outputs else "" for o in ext_outputs
     ]
 
-    # --- Step 2: Batch sentiment CoT + logits ---
-    sentiment_prompts = [
+    # --- Step 2: Batch real logprobs for sentiment (2 vLLM calls internally) ---
+    # Phase 1 (CoT generation) + Phase 2 (N×K scoring prompts) are both
+    # handled inside get_real_choice_logits_batch as single batched calls.
+    cot_prompts = [
         _format_chat_prompt("", SENTIMENT_COT_PROMPT.format(article_text=t))
         for t in article_texts
     ]
-    sentiment_results = get_choice_logits_batch(
+    sentiment_results = get_real_choice_logits_batch(
         engine=_vllm_engine,
-        prompts=sentiment_prompts,
+        cot_prompts=cot_prompts,
         choices=SENTIMENT_CLASSES,
-        max_tokens=LOGITS_MAX_TOKENS,
-        temperature=0.0,
+        decision_prefix=SENTIMENT_DECISION_PREFIX,
+        tokenizer=_chat_tokenizer,
+        max_cot_tokens=LOGITS_MAX_TOKENS,
     )
 
     # --- Step 3: Per-item assembly (output logic unchanged) ---

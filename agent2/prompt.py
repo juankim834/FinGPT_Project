@@ -1,76 +1,54 @@
 """
-agent2/prompt.py — Prompt for Agent 2 (trading strategy reasoner).
+agent2/prompt.py — Prompts for Agent 2 (trading strategy reasoner).
 
-The prompt follows the same CoT + logits pattern as Agent 1:
+STRATEGY_COT_PROMPT
+    Instructs the DeepSeek-R1 model to reason about the appropriate trading
+    strategy given the news article and Agent 1's sentiment analysis.
+    Reasoning is written inside ``<think>…</think>`` tags; vLLM stops
+    generation at ``</think>``.
 
-  Step 1 — Reasoning inside <think>…</think>:
-    The model combines the news article text with Agent 1's sentiment analysis
-    and reasons about the appropriate trading strategy.
+    ``vllm_logits_client.get_real_choice_logits`` then scores each strategy
+    label (BUY, HOLD, SELL) by reading real token-level log-probabilities via
+    ``SamplingParams(prompt_logprobs=1)`` at the decision point.
 
-  Step 2 — Final output after </think>:
-    A single JSON object with self-reported logits for the three strategies
-    BUY, HOLD, SELL in that fixed order.
+    The model is NOT asked to output a JSON object or numeric logits.
 
-All probability calculations, strategy selection, and confidence scoring are
-done deterministically in Python using softmax post-processing.
+STRATEGY_DECISION_PREFIX
+    Appended after the CoT to create the decision context for scoring.
+    Must end with a space so the choice token attaches cleanly.
 """
+
+# ---------------------------------------------------------------------------
+# Strategy CoT prompt (Phase 1 — reasoning only, no answer expected)
+# ---------------------------------------------------------------------------
 
 STRATEGY_COT_PROMPT: str = """\
 You are a quantitative trading strategist.
 
-You will be given:
-  1. A financial news article.
-  2. A sentiment analysis produced by Agent 1.
+Based on the news article and sentiment analysis below, reason step by step \
+about the appropriate trading strategy. Write your analysis inside \
+<think>...</think> tags. Consider:
 
-Your task has two steps:
+• What price direction does this news imply in the near term?
+• Does the sentiment analysis align with the factual content?
+• Is the signal strong enough to trade (BUY or SELL), or should we wait (HOLD)?
+• How confident are you given any ambiguity in the news?
 
-Step 1 — Reasoning (write inside <think> tags):
-Analyse the article and the sentiment analysis together.  Consider:
-  • What is the likely short-term price impact of this news?
-  • Does the sentiment align with the factual content of the article?
-  • Is there sufficient conviction to trade (BUY or SELL), or should we wait (HOLD)?
-  • What is the magnitude of the expected move?
-Write your step-by-step reasoning inside <think> and </think> tags.
-
-Step 2 — Final output (after the </think> tag):
-Output a single JSON object containing the raw logit scores for exactly three
-trading strategies in this fixed order: BUY, HOLD, SELL.
-
-Rules:
-  • BUY  → expect the stock to rise; go long.
-  • HOLD → uncertain or insufficient signal; stay flat.
-  • SELL → expect the stock to fall; go short.
-  • Do NOT output a strategy label, probability, or any other text outside JSON.
-  • The logit values are unscaled real numbers (positive or negative).
-  • Higher logit → stronger belief in that strategy.
-  • The JSON must have exactly one key: "logits", whose value is a list of
-    three numbers.
-
-Few-shot example
-----------------
-Sentiment analysis: {{"sentiment": "POSITIVE", "confidence": 0.87,
-  "probabilities": {{"POSITIVE": 0.87, "NEGATIVE": 0.08, "NEUTRAL": 0.05}}}}
-
-Article: "Company Y announces record quarterly revenue, raising full-year outlook
-by 12%.  Analyst consensus upgrades to Strong Buy."
-
-<think>
-The article reports a strong revenue beat and management guidance upgrade.
-Analyst consensus is improving.  The sentiment is strongly POSITIVE (conf=0.87).
-This is a clear near-term bullish catalyst.  BUY logit should be the highest.
-SELL logit should be very negative.  Some small HOLD weight for uncertainty.
-</think>
-{{"logits": [2.1, 0.3, -1.8]}}
-
-----------------
-Now analyse the following:
-
-Sentiment analysis result:
+Sentiment analysis:
 {sentiment_json}
 
 News article:
-{article_text}
+{article_text}\
 """
 
-# Keep old name as alias for any external imports.
+# ---------------------------------------------------------------------------
+# Decision prefix (Phase 2 — appended after </think> for logprob scoring)
+# ---------------------------------------------------------------------------
+
+# The model's next-token distribution at "Strategy: " is scored for each
+# of the three strategy labels: BUY, HOLD, SELL.
+# Must end with a space so the choice token aligns with BPE tokenisation.
+STRATEGY_DECISION_PREFIX: str = "Strategy: "
+
+# Backward-compatible alias.
 SYSTEM_PROMPT: str = STRATEGY_COT_PROMPT

@@ -37,9 +37,13 @@ from config import (
     STRATEGY_SET,
 )
 from agent1.schema import NewsFingerprint
-from agent2.prompt import STRATEGY_COT_PROMPT
+from agent2.prompt import STRATEGY_COT_PROMPT, STRATEGY_DECISION_PREFIX
 from agent2.schema import TradingSignal
-from vllm_logits_client import get_choice_logits, get_choice_logits_batch, softmax
+from vllm_logits_client import (
+    get_real_choice_logits,
+    get_real_choice_logits_batch,
+    softmax,
+)
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -351,38 +355,44 @@ def generate_signal_batch(
     fingerprints: list[NewsFingerprint],
 ) -> list[Optional[TradingSignal]]:
     """
-    Batch version of ``generate_signal``.
+    Batch version of ``generate_signal`` using real model logprobs.
 
-    Sends all strategy-selection prompts to vLLM in a **single**
-    ``engine.generate()`` call, then processes each result independently with
-    the same output logic as the single-item path (via ``_process_signal_result``).
+    Makes **two** batched ``engine.generate()`` calls (handled inside
+    ``get_real_choice_logits_batch``):
+      Phase 1 — N CoT generations (stop at </think>).
+      Phase 2 — N × K prompt_logprobs scoring calls.
 
-    Returns a list of the same length as *fingerprints*.  Items are ``None``
-    wherever logits parsing fails (strict mode) or a ``TradingSignal`` validation
-    error occurs.
+    Per-item output logic (softmax, argmax, TradingSignal assembly) is
+    unchanged and applied via ``_process_signal_result``.
     """
     _load_model()
 
     if not fingerprints:
         return []
 
-    prompts = [_build_prompt(fp) for fp in fingerprints]
+    if _chat_tokenizer is None:
+        raise RuntimeError(
+            "Tokenizer not loaded — cannot compute real choice logprobs. "
+            "Ensure FINGPT_MODEL_PATH is set before calling generate_signal_batch."
+        )
 
-    results = get_choice_logits_batch(
+    cot_prompts = [_build_prompt(fp) for fp in fingerprints]
+
+    results = get_real_choice_logits_batch(
         engine=_vllm_engine,
-        prompts=prompts,
+        cot_prompts=cot_prompts,
         choices=STRATEGY_SET,
-        max_tokens=LOGITS_MAX_TOKENS,
-        temperature=0.0,
+        decision_prefix=STRATEGY_DECISION_PREFIX,
+        tokenizer=_chat_tokenizer,
+        max_cot_tokens=LOGITS_MAX_TOKENS,
     )
 
     signals: list[Optional[TradingSignal]] = []
     for i, (fingerprint, result) in enumerate(zip(fingerprints, results)):
         _save_md_debug_output(fingerprint, result["raw_output"], i + 1, LOGITS_MAX_TOKENS)
         logger.info(
-            "Batch signal[%d] raw output (first 300 chars): %s",
-            i,
-            result["raw_output"][:300],
+            "Batch signal[%d] real logprobs %s → choices %s",
+            i, result["logits"], STRATEGY_SET,
         )
         try:
             signals.append(_process_signal_result(fingerprint, result))
@@ -397,30 +407,36 @@ def generate_signal_batch(
 
 def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
     """
-    Run logits-based vLLM inference to produce a TradingSignal (single-item).
+    Produce a TradingSignal using real model logprobs (single-item path).
 
-    Strategy selection and confidence are computed deterministically from the
-    logits JSON the model emits — the LLM never outputs the final label.
-    Output logic is fully delegated to ``_process_signal_result``.
+    Two vLLM calls are made (Phase 1 CoT + Phase 2 scoring), handled inside
+    ``get_real_choice_logits``.  Output logic is delegated to
+    ``_process_signal_result`` — unchanged from the previous version.
 
     Returns None on any model, parse, or validation failure (strict mode).
     """
     try:
         _load_model()
 
-        prompt = _build_prompt(fingerprint)
-        result = get_choice_logits(
+        if _chat_tokenizer is None:
+            raise RuntimeError(
+                "Tokenizer not loaded — cannot compute real choice logprobs."
+            )
+
+        cot_prompt = _build_prompt(fingerprint)
+        result = get_real_choice_logits(
             engine=_vllm_engine,
-            prompt=prompt,
+            cot_prompt=cot_prompt,
             choices=STRATEGY_SET,
-            max_tokens=LOGITS_MAX_TOKENS,
-            temperature=0.0,
+            decision_prefix=STRATEGY_DECISION_PREFIX,
+            tokenizer=_chat_tokenizer,
+            max_cot_tokens=LOGITS_MAX_TOKENS,
         )
 
         _save_md_debug_output(fingerprint, result["raw_output"], 1, LOGITS_MAX_TOKENS)
         logger.info(
-            "Agent 2 raw output (first 300 chars): %s",
-            result["raw_output"][:300],
+            "Agent 2 real logprobs %s → choices %s",
+            result["logits"], STRATEGY_SET,
         )
 
         return _process_signal_result(fingerprint, result)
