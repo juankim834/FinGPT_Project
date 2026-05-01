@@ -74,6 +74,7 @@ _STRATEGY_TAG: dict[str, str] = {
 
 _vllm_engine = None
 _chat_tokenizer = None
+_null_logprobs: Optional[list[float]] = None   # PMI prior — computed once per engine load
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +142,61 @@ def _load_model() -> None:
 
 def set_shared_vllm_engine(engine) -> None:
     """Inject a preloaded vLLM engine for Agent 2 reuse."""
-    global _vllm_engine  # noqa: PLW0603
+    global _vllm_engine, _null_logprobs  # noqa: PLW0603
     _vllm_engine = engine
+    _null_logprobs = None   # reset so null logprobs are re-computed for the new engine
     _ensure_chat_tokenizer()
     logger.info("Injected shared vLLM engine into Agent 2 reasoner.")
+
+
+# ---------------------------------------------------------------------------
+# PMI prior correction
+# ---------------------------------------------------------------------------
+
+def _compute_null_logprobs() -> Optional[list[float]]:
+    """
+    Compute the language-model prior logprobs for the scoring tokens (A/B/C)
+    using a fully neutral article so they can be subtracted from per-article
+    logprobs (Pointwise Mutual Information / prior correction).
+
+    Without this step, the token "B" has a strong unconditional prior at the
+    decision point ``"The answer is ("`` that causes HOLD to dominate
+    regardless of the news content.
+
+    Calling convention: invoked once per engine session on the first inference
+    call; result cached in ``_null_logprobs``.
+    """
+    if _vllm_engine is None or _chat_tokenizer is None:
+        return None
+
+    null_fp = NewsFingerprint(
+        source="null",
+        published_at="",
+        headline="No specific news.",
+        companies_named=["UNKNOWN"],
+        event_keywords=[],
+        sentiment_label="NEUTRAL",
+        sentiment_score=0.0,
+        sentiment_confidence=0.333,
+        sentiment_probabilities={"POSITIVE": 0.333, "NEGATIVE": 0.333, "NEUTRAL": 0.333},
+        article_text="No specific news available for this period.",
+    )
+    try:
+        null_cot_prompt = _build_prompt(null_fp)
+        result = get_real_choice_logits(
+            engine=_vllm_engine,
+            cot_prompt=null_cot_prompt,
+            choices=STRATEGY_SCORE_TOKENS,
+            decision_prefix=STRATEGY_DECISION_PREFIX,
+            tokenizer=_chat_tokenizer,
+            max_cot_tokens=256,     # short budget — only need null CoT, not full reasoning
+        )
+        null_lp = result["logits"]
+        logger.info("PMI null logprobs (A/B/C): %s", null_lp)
+        return null_lp
+    except Exception as exc:
+        logger.warning("Could not compute PMI null logprobs: %s — skipping correction.", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +359,17 @@ def _process_signal_result(
         _save_failure_diagnostic(fingerprint, result["raw_output"])
         return None
 
-    logits: list[float] = result["logits"]
+    raw_logits: list[float] = result["logits"]
+
+    # PMI prior correction: subtract null-context logprobs so that the
+    # decision is driven by news content rather than the token "B" having a
+    # strong unconditional prior at "The answer is (".
+    # PMI(choice) = logP(choice | article) − logP(choice | null_context)
+    if _null_logprobs is not None and len(_null_logprobs) == len(raw_logits):
+        logits = [a - b for a, b in zip(raw_logits, _null_logprobs)]
+        logger.debug("PMI correction applied: raw=%s null=%s pmi=%s", raw_logits, _null_logprobs, logits)
+    else:
+        logits = raw_logits
 
     probs = softmax(logits, temperature=CALIBRATION_T)
     best_idx = probs.index(max(probs))
@@ -319,7 +381,8 @@ def _process_signal_result(
     strategy_tag: str = _STRATEGY_TAG[strategy]
 
     logger.info(
-        "Agent 2 logits=%s  probs=%s  strategy=%s  dir=%s  conf=%.4f",
+        "Agent 2 raw_logits=%s  pmi_logits=%s  probs=%s  strategy=%s  dir=%s  conf=%.4f",
+        raw_logits,
         logits,
         [f"{p:.4f}" for p in probs],
         strategy,
@@ -369,6 +432,7 @@ def generate_signal_batch(
     Per-item output logic (softmax, argmax, TradingSignal assembly) is
     unchanged and applied via ``_process_signal_result``.
     """
+    global _null_logprobs  # noqa: PLW0603
     _load_model()
 
     if not fingerprints:
@@ -379,6 +443,10 @@ def generate_signal_batch(
             "Tokenizer not loaded — cannot compute real choice logprobs. "
             "Ensure FINGPT_MODEL_PATH is set before calling generate_signal_batch."
         )
+
+    # Compute PMI null logprobs once per engine session (first batch call).
+    if _null_logprobs is None:
+        _null_logprobs = _compute_null_logprobs()
 
     cot_prompts = [_build_prompt(fp) for fp in fingerprints]
 
@@ -419,6 +487,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
 
     Returns None on any model, parse, or validation failure (strict mode).
     """
+    global _null_logprobs  # noqa: PLW0603
     try:
         _load_model()
 
@@ -426,6 +495,10 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
             raise RuntimeError(
                 "Tokenizer not loaded — cannot compute real choice logprobs."
             )
+
+        # Compute PMI null logprobs once per engine session.
+        if _null_logprobs is None:
+            _null_logprobs = _compute_null_logprobs()
 
         cot_prompt = _build_prompt(fingerprint)
         result = get_real_choice_logits(
