@@ -8,6 +8,7 @@ import json
 import os
 from typing import Optional
 
+import pandas as pd
 import yfinance as yf
 
 _RETURN_CACHE: dict[tuple[str, str, str], Optional[float]] = {}
@@ -93,18 +94,26 @@ def get_realized_return(
             tickers=ticker,
             start=start_date,
             end=end_date,
-            interval="1wk",
+            interval="1d",          # daily bars: 5 trading days in any 7-day window
             auto_adjust=True,
             progress=False,
         )
     except Exception:
         return _store_cached_value(ticker, start_date, end_date, None)
 
-    if hist is None or hist.empty or "Close" not in hist.columns or len(hist.index) < 2:
+    if hist is None or hist.empty:
+        return _store_cached_value(ticker, start_date, end_date, None)
+
+    # Flatten MultiIndex columns (yfinance ≥0.2.38 with a single ticker returns
+    # columns like ("Close", "AXP"); older versions return flat "Close").
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = hist.columns.get_level_values(0)
+
+    if "Close" not in hist.columns:
         return _store_cached_value(ticker, start_date, end_date, None)
 
     closes = hist["Close"].dropna()
-    if closes.empty or len(closes.index) < 2:
+    if closes.empty:
         return _store_cached_value(ticker, start_date, end_date, None)
 
     first_close = float(closes.iloc[0])

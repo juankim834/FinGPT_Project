@@ -37,7 +37,11 @@ from config import (
     STRATEGY_SET,
 )
 from agent1.schema import NewsFingerprint
-from agent2.prompt import STRATEGY_COT_PROMPT, STRATEGY_DECISION_PREFIX
+from agent2.prompt import (
+    STRATEGY_COT_PROMPT,
+    STRATEGY_DECISION_PREFIX,
+    STRATEGY_SCORE_TOKENS,
+)
 from agent2.schema import TradingSignal
 from vllm_logits_client import (
     get_real_choice_logits,
@@ -381,7 +385,7 @@ def generate_signal_batch(
     results = get_real_choice_logits_batch(
         engine=_vllm_engine,
         cot_prompts=cot_prompts,
-        choices=STRATEGY_SET,
+        choices=STRATEGY_SCORE_TOKENS,      # ["A","B","C"] → A=BUY, B=HOLD, C=SELL
         decision_prefix=STRATEGY_DECISION_PREFIX,
         tokenizer=_chat_tokenizer,
         max_cot_tokens=LOGITS_MAX_TOKENS,
@@ -427,7 +431,7 @@ def generate_signal(fingerprint: NewsFingerprint) -> Optional[TradingSignal]:
         result = get_real_choice_logits(
             engine=_vllm_engine,
             cot_prompt=cot_prompt,
-            choices=STRATEGY_SET,
+            choices=STRATEGY_SCORE_TOKENS,  # ["A","B","C"] → A=BUY, B=HOLD, C=SELL
             decision_prefix=STRATEGY_DECISION_PREFIX,
             tokenizer=_chat_tokenizer,
             max_cot_tokens=LOGITS_MAX_TOKENS,
