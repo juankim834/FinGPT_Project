@@ -78,3 +78,12 @@ LOGITS_MAX_TOKENS: int = int(os.getenv("FINGPT_LOGITS_MAX_TOKENS", "1024"))
 LOGS_DIR: str = "logs"
 OUTPUT_DIR: str = "output"
 LOG_LEVEL: str = "INFO"
+
+# ---------------------------------------------------------------------------
+# PMI prior cache
+# ---------------------------------------------------------------------------
+# Path where Agent 2's null-context logprobs (PMI prior) are persisted.
+# On first inference the file is written; subsequent sessions load it
+# immediately, skipping the extra vLLM call entirely.
+# Set to "" to disable persistence (always recompute).
+PMI_PRIOR_PATH: str = os.getenv("FINGPT_PMI_PRIOR_PATH", "output/pmi_null_logprobs.json")

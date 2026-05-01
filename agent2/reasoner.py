@@ -1,22 +1,22 @@
 """
-agent2/reasoner.py — Agent 2: logits-based trading strategy reasoner.
+agent2/reasoner.py — Agent 2: real-logprobs trading strategy reasoner.
 
-The LLM performs chain-of-thought reasoning about the news and Agent 1's
-sentiment, then emits a compact JSON object with self-reported logits for the
-three strategies BUY, HOLD, SELL.
+The LLM performs two-phase inference:
+  Phase 1 — Chain-of-thought reasoning (greedy, temperature=0.0, stop at </think>).
+  Phase 2 — Scoring: one prompt_logprobs call per choice token (A / B / C).
 
-All decision logic is handled deterministically in Python:
-  probs   = softmax(logits / CALIBRATION_T)
-  choice  = STRATEGY_SET[argmax(probs)]          # "BUY" | "HOLD" | "SELL"
-  direction = _STRATEGY_DIRECTION[choice]         # "long" | "neutral" | "short"
+All decision logic is deterministic Python:
+  pmi_logits = raw_logits − null_logprobs          # PMI bias correction
+  probs      = softmax(pmi_logits / CALIBRATION_T)
+  choice     = STRATEGY_SET[argmax(probs)]         # "BUY" | "HOLD" | "SELL"
+  direction  = _STRATEGY_DIRECTION[choice]          # "long" | "neutral" | "short"
   confidence = max(probs)
 
-The TradingSignal.cot field is populated from the <think>…</think> block
-extracted from the model output, preserving the reasoning audit trail.
+PMI null logprobs (the model's unconditional prior at "Strategy: ") are
+computed once per model, then persisted to PMI_PRIOR_PATH (JSON) so that
+subsequent sessions skip the extra vLLM call.
 
-Strict mode: if the model output cannot be parsed as JSON containing a
-"logits" field of length len(STRATEGY_SET), generate_signal() returns None
-and writes a diagnostic markdown file.
+generate_signal() returns None on any inference or validation failure.
 """
 
 import json
@@ -33,6 +33,7 @@ from config import (
     LOG_LEVEL,
     LOGITS_MAX_TOKENS,
     LOGS_DIR,
+    PMI_PRIOR_PATH,
     SHARE_SINGLE_LLM_BETWEEN_AGENTS,
     STRATEGY_SET,
 )
@@ -153,22 +154,98 @@ def set_shared_vllm_engine(engine) -> None:
 # PMI prior correction
 # ---------------------------------------------------------------------------
 
+def _pmi_cache_key() -> dict:
+    """Return the metadata dict used to validate a saved PMI prior file."""
+    return {
+        "model_path": FINGPT_MODEL_PATH,
+        "decision_prefix": STRATEGY_DECISION_PREFIX,
+        "score_tokens": STRATEGY_SCORE_TOKENS,
+    }
+
+
+def _load_null_logprobs_from_disk() -> Optional[list[float]]:
+    """
+    Try to load a previously saved PMI prior from ``PMI_PRIOR_PATH``.
+
+    The file is only accepted when its ``model_path``, ``decision_prefix``,
+    and ``score_tokens`` fields match the current configuration — guarding
+    against accidental reuse after a model or prompt change.
+
+    Returns ``None`` when the file does not exist, is invalid, or the key
+    does not match.
+    """
+    if not PMI_PRIOR_PATH:
+        return None
+    try:
+        with open(PMI_PRIOR_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        key = _pmi_cache_key()
+        if (
+            data.get("model_path") == key["model_path"]
+            and data.get("decision_prefix") == key["decision_prefix"]
+            and data.get("score_tokens") == key["score_tokens"]
+        ):
+            null_lp: list[float] = data["null_logprobs"]
+            logger.info(
+                "PMI prior loaded from disk (%s): %s", PMI_PRIOR_PATH, null_lp
+            )
+            return null_lp
+        logger.info(
+            "PMI prior cache key mismatch — will recompute. "
+            "Saved: model=%r prefix=%r tokens=%r  "
+            "Current: model=%r prefix=%r tokens=%r",
+            data.get("model_path"), data.get("decision_prefix"), data.get("score_tokens"),
+            key["model_path"], key["decision_prefix"], key["score_tokens"],
+        )
+    except FileNotFoundError:
+        logger.info("No PMI prior cache found at %s — will compute.", PMI_PRIOR_PATH)
+    except Exception as exc:
+        logger.warning("Could not read PMI prior cache: %s — will recompute.", exc)
+    return None
+
+
+def _save_null_logprobs_to_disk(null_lp: list[float]) -> None:
+    """Persist the PMI prior to ``PMI_PRIOR_PATH`` with a validation key."""
+    if not PMI_PRIOR_PATH:
+        return
+    try:
+        os.makedirs(os.path.dirname(PMI_PRIOR_PATH) or ".", exist_ok=True)
+        payload = {
+            **_pmi_cache_key(),
+            "null_logprobs": null_lp,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(PMI_PRIOR_PATH, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        logger.info("PMI prior saved to %s: %s", PMI_PRIOR_PATH, null_lp)
+    except Exception as exc:
+        logger.warning("Could not save PMI prior to disk: %s", exc)
+
+
 def _compute_null_logprobs() -> Optional[list[float]]:
     """
-    Compute the language-model prior logprobs for the scoring tokens (A/B/C)
-    using a fully neutral article so they can be subtracted from per-article
-    logprobs (Pointwise Mutual Information / prior correction).
+    Return the language-model prior log-probabilities for the scoring tokens
+    (A / B / C) using a fully neutral article (PMI baseline).
 
-    Without this step, the token "B" has a strong unconditional prior at the
-    decision point ``"The answer is ("`` that causes HOLD to dominate
-    regardless of the news content.
+    Load order:
+      1. Return the in-memory ``_null_logprobs`` if already set (caller's job).
+      2. Try to load a matching prior from ``PMI_PRIOR_PATH`` on disk.
+      3. Run a vLLM inference call with a null/neutral article and save the
+         result to disk for future sessions.
 
-    Calling convention: invoked once per engine session on the first inference
-    call; result cached in ``_null_logprobs``.
+    Without this correction, one letter consistently dominates because the
+    language model assigns an unconditional prior to certain tokens at the
+    ``"Strategy: "`` decision position regardless of news content.
     """
     if _vllm_engine is None or _chat_tokenizer is None:
         return None
 
+    # Step 2: try disk cache
+    cached = _load_null_logprobs_from_disk()
+    if cached is not None:
+        return cached
+
+    # Step 3: compute via vLLM and persist
     null_fp = NewsFingerprint(
         source="null",
         published_at="",
@@ -189,10 +266,11 @@ def _compute_null_logprobs() -> Optional[list[float]]:
             choices=STRATEGY_SCORE_TOKENS,
             decision_prefix=STRATEGY_DECISION_PREFIX,
             tokenizer=_chat_tokenizer,
-            max_cot_tokens=256,     # short budget — only need null CoT, not full reasoning
+            max_cot_tokens=256,     # short budget — null reasoning only
         )
         null_lp = result["logits"]
-        logger.info("PMI null logprobs (A/B/C): %s", null_lp)
+        logger.info("PMI null logprobs computed (A/B/C): %s", null_lp)
+        _save_null_logprobs_to_disk(null_lp)
         return null_lp
     except Exception as exc:
         logger.warning("Could not compute PMI null logprobs: %s — skipping correction.", exc)
@@ -362,8 +440,8 @@ def _process_signal_result(
     raw_logits: list[float] = result["logits"]
 
     # PMI prior correction: subtract null-context logprobs so that the
-    # decision is driven by news content rather than the token "B" having a
-    # strong unconditional prior at "The answer is (".
+    # decision is driven by news content rather than a token's unconditional
+    # prior at the "Strategy: " decision position.
     # PMI(choice) = logP(choice | article) − logP(choice | null_context)
     if _null_logprobs is not None and len(_null_logprobs) == len(raw_logits):
         logits = [a - b for a, b in zip(raw_logits, _null_logprobs)]
