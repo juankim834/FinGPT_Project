@@ -121,26 +121,69 @@ def _resolve_choice_token_ids(
 ) -> tuple[int, list[int]]:
     """
     Tokenize ``scoring_context`` and ``scoring_context + choice`` and return
-    ``(context_len, choice_token_ids)`` where:
+    ``(diverge_at, choice_token_ids)`` where:
 
-    * ``context_len``      — number of tokens in the scoring context (used as
-                             the starting index into ``prompt_logprobs``).
-    * ``choice_token_ids`` — token IDs of *choice* as they appear at the end
-                             of the full scoring prompt.  Tokenizing the full
-                             string handles BPE boundary effects correctly.
+    * ``diverge_at``       — index of the first token position where the two
+                             encodings differ.  Used as the starting index into
+                             ``prompt_logprobs`` for the choice tokens.
+    * ``choice_token_ids`` — token IDs of *choice* as they appear in the full
+                             scoring prompt starting at ``diverge_at``.
+
+    Why not just ``full_ids[len(context_ids):]``?
+    --------------------------------------------
+    BPE tokenizers can merge the last character(s) of ``scoring_context`` with
+    the first character(s) of ``choice`` into a single token.  Example::
+
+        scoring_context = "...The answer is ("
+        choice          = "A"
+        tokenizer.encode("...The answer is (")  → [..., tok("(")]   # N tokens
+        tokenizer.encode("...The answer is (A") → [..., tok("(A")]  # N tokens (!)
+
+    Both encodings have the SAME length, so the naïve tail-slice produces an
+    empty ``choice_ids = []``.  The inner loop of ``_sum_choice_logprob`` then
+    never executes and silently returns ``(0.0, True)`` for every choice,
+    yielding uniform logprobs ``[0, 0, 0]`` and ``softmax`` probabilities of
+    ``[1/3, 1/3, 1/3]`` — the exact symptom reported in the smoke test.
+
+    Divergence-finding fix: scan both encodings token-by-token and return
+    everything from the first mismatch onward.  For the ``"(A"`` example::
+
+        diverge_at    = N-1   (last position differs)
+        choice_ids    = [tok("(A")]
+        prompt_logprobs[N-1][tok("(A")] → logP("(A" | ctx without "(")  ✓
+
+    The measurement is still valid because the ``"("`` prefix is the same for
+    all choices (A / B / C all merge identically), so the shift cancels in
+    softmax.
 
     Both tokenizations use ``add_special_tokens=False`` because the scoring
-    context is already the output of ``apply_chat_template``, which embeds
-    all required special tokens (BOS etc.) as literal characters in the string.
-    vLLM encodes prompts the same way (no extra BOS prepended when the string
-    already starts with a BOS character), so the indices align.
+    context already contains the special tokens (BOS etc.) added by
+    ``apply_chat_template``.  vLLM encodes the same way, so indices align.
     """
     context_ids: list[int] = tokenizer.encode(scoring_context, add_special_tokens=False)
     full_ids: list[int] = tokenizer.encode(
         scoring_context + choice, add_special_tokens=False
     )
-    choice_ids = full_ids[len(context_ids):]
-    return len(context_ids), choice_ids
+
+    # Find first position where the two encodings diverge.
+    min_len = min(len(context_ids), len(full_ids))
+    diverge_at = min_len  # default: no overlap divergence (choice cleanly appended)
+    for i in range(min_len):
+        if context_ids[i] != full_ids[i]:
+            diverge_at = i
+            break
+
+    choice_ids = full_ids[diverge_at:]
+
+    if not choice_ids:
+        logger.warning(
+            "_resolve_choice_token_ids: choice %r produced no token delta "
+            "(context_len=%d, full_len=%d). Encoding is ambiguous; "
+            "_sum_choice_logprob will return -100 penalty.",
+            choice, len(context_ids), len(full_ids),
+        )
+
+    return diverge_at, choice_ids
 
 
 def _sum_choice_logprob(
@@ -164,6 +207,11 @@ def _sum_choice_logprob(
     """
     if not prompt_logprobs:
         return -100.0 * max(len(choice_token_ids), 1), False
+
+    # Guard against BPE-merge producing an empty token list (should be caught
+    # upstream by _resolve_choice_token_ids, but defend here too).
+    if not choice_token_ids:
+        return -100.0, False
 
     total = 0.0
     all_found = True

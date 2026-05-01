@@ -7,7 +7,7 @@ STRATEGY_COT_PROMPT
     Reasoning is written inside ``<think>…</think>`` tags; vLLM stops
     generation at ``</think>``.
 
-    After the CoT the model picks one of three lettered options (A / B / C).
+    After the CoT, the model picks one of three lettered options (A / B / C).
     ``vllm_logits_client.get_real_choice_logits`` scores the single-character
     tokens "A", "B", "C" via ``SamplingParams(prompt_logprobs=1)``, which
     have near-equal language-model priors and therefore avoid the directional
@@ -17,14 +17,24 @@ STRATEGY_COT_PROMPT
 
 STRATEGY_DECISION_PREFIX
     Appended after ``</think>\\n`` in Phase 2 to create the decision context.
-    Scoring tokens are STRATEGY_SCORE_TOKENS = ["A", "B", "C"] which map
-    positionally to STRATEGY_SET = ["BUY", "HOLD", "SELL"].
+
+    **Must end with a space or a character that cannot BPE-merge with the
+    first character of the scoring tokens.**  The previous prefix
+    ``"The answer is ("`` caused ``"(A"``, ``"(B"``, ``"(C"`` to be merged
+    into single tokens by the LLaMA/DeepSeek BPE vocabulary, making
+    ``_resolve_choice_token_ids`` produce an empty ``choice_ids`` list and
+    ``_sum_choice_logprob`` silently return ``0.0`` for all choices —
+    yielding ``softmax([0,0,0]) = [1/3,1/3,1/3]``.
+
+    ``"Strategy: "`` ends with ``": "`` (colon + space).  The LLaMA/DeepSeek
+    tokenizer never merges a trailing space with a following capital letter,
+    so "A", "B", "C" are always resolved as distinct tokens.
 
 STRATEGY_SCORE_TOKENS
     The actual tokens passed to ``get_real_choice_logits`` / ``_batch``.
     Single ASCII letters are reliably single-token in all BPE vocabularies and
     have balanced priors, eliminating the HOLD-dominance artefact seen when
-    scoring the words "BUY" / "HOLD" / "SELL" after "Strategy: ".
+    scoring the words "BUY" / "HOLD" / "SELL" directly.
 """
 
 # ---------------------------------------------------------------------------
@@ -44,9 +54,9 @@ inside <think>...</think> tags. Consider:
 • How confident are you given any ambiguity in the news?
 
 At the end you will select one lettered option:
-  (A) BUY  — bullish signal; expect the price to rise over the next week
-  (B) HOLD — insufficient or ambiguous signal; stay flat
-  (C) SELL — bearish signal; expect the price to fall over the next week
+  A = BUY  — bullish signal; expect the price to rise over the next week
+  B = HOLD — insufficient or ambiguous signal; stay flat
+  C = SELL — bearish signal; expect the price to fall over the next week
 
 Sentiment analysis:
 {sentiment_json}
@@ -59,9 +69,11 @@ News article:
 # Decision prefix and scoring tokens (Phase 2 — prompt_logprobs scoring)
 # ---------------------------------------------------------------------------
 
-# Appended after </think>\n so the scoring context ends with an open paren.
-# Single-letter tokens A / B / C are scored at this position.
-STRATEGY_DECISION_PREFIX: str = "The answer is ("
+# Appended after </think>\n.  Ends with ": " (colon + space) so that single-
+# letter tokens A / B / C are never BPE-merged with the preceding character.
+# (The previous "The answer is (" caused "(A"/"(B"/"(C" to merge into single
+# tokens, producing empty choice_ids and uniform [0,0,0] logprobs.)
+STRATEGY_DECISION_PREFIX: str = "Strategy: "
 
 # Tokens passed to get_real_choice_logits / _batch.
 # Positional mapping: A → BUY (idx 0), B → HOLD (idx 1), C → SELL (idx 2).
