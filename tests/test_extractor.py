@@ -316,3 +316,31 @@ class TestAssembleFingerprint:
         fp = self.fn(extracted, sentiment, event_type, "article text", fallback_ticker="AAPL")
         assert fp.ticker == "AAPL"
         assert fp.companies_named == ["MSFT"]
+
+    def test_source_list_is_coerced_to_first_string(self):
+        extracted, sentiment, event_type = self._make_inputs()
+        extracted["source"] = ["Reuters", "Yahoo Finance", "Google"]
+        fp = self.fn(extracted, sentiment, event_type, "article text")
+        assert fp.source == "Reuters"
+
+
+class TestExtractionFallback:
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from agent1.extractor import _parse_extraction_or_fallback
+        self.fn = _parse_extraction_or_fallback
+
+    def test_invalid_json_falls_back_to_empty_payload(self):
+        extracted = self.fn("not json at all", context_label="test_case")
+        assert extracted == {
+            "source": "",
+            "published_at": "",
+            "headline": "",
+            "companies_named": [],
+            "event_keywords": [],
+        }
+
+    def test_empty_output_falls_back_to_empty_payload(self):
+        extracted = self.fn("", context_label="test_case")
+        assert extracted["source"] == ""
+        assert extracted["companies_named"] == []

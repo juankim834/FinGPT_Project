@@ -182,6 +182,27 @@ def _normalize_generated_text(text: str) -> str:
     return cleaned
 
 
+def _coerce_string_field(value: Any) -> str:
+    """
+    Normalize a loosely-typed extracted field into a single string.
+
+    Multi-news samples can cause the extractor to return lists for scalar
+    metadata fields such as ``source``. For those cases we keep the first
+    non-empty value so the row can still proceed through backtesting.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        for item in value:
+            normalized = _coerce_string_field(item)
+            if normalized:
+                return normalized
+        return ""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def _extract_json_blob(text: str) -> str:
     cleaned = _strip_code_fences(text)
     match = _JSON_OBJ_RE.search(cleaned)
@@ -313,6 +334,40 @@ def _parse_extraction_structured(raw_output: str) -> dict[str, Any]:
         if parsed.get("headline") or parsed.get("companies_named"):
             return parsed
         raise
+
+
+def _empty_extraction_payload() -> dict[str, Any]:
+    """Fallback extraction payload used when fact-extraction output is unusable."""
+    return {
+        "source": "",
+        "published_at": "",
+        "headline": "",
+        "companies_named": [],
+        "event_keywords": [],
+    }
+
+
+def _parse_extraction_or_fallback(
+    clean_extraction: str,
+    *,
+    context_label: str,
+) -> dict[str, Any]:
+    """
+    Parse the fact-extraction output, degrading gracefully on malformed JSON.
+
+    When the extractor output is empty or unparsable, return an empty payload so
+    sentiment/event_type can still flow through the backtest using upstream
+    ticker/headline fallbacks.
+    """
+    try:
+        return _parse_extraction_structured(clean_extraction)
+    except Exception as exc:
+        logger.warning(
+            "%s fact extraction parse failed (%s); using empty extraction payload.",
+            context_label,
+            exc,
+        )
+        return _empty_extraction_payload()
 
 
 # ---------------------------------------------------------------------------
@@ -697,8 +752,8 @@ def _assemble_fingerprint(
     et = event_type.get("event_type", "OTHER")
     payload: dict[str, Any] = {
         "ticker": fallback_ticker or "",
-        "source": extracted.get("source", ""),
-        "published_at": extracted.get("published_at", ""),
+        "source": _coerce_string_field(extracted.get("source", "")),
+        "published_at": _coerce_string_field(extracted.get("published_at", "")),
         "headline": fallback_headline or extracted.get("headline", ""),
         "companies_named": companies_named,
         # Backward compat: set to [event_type] so downstream code that reads
@@ -851,7 +906,10 @@ def extract_fingerprint_batch(
                 "Batch extraction[%d] output (first 240 chars): %s",
                 i, clean_extraction[:240],
             )
-            extracted = _parse_extraction_structured(clean_extraction)
+            extracted = _parse_extraction_or_fallback(
+                clean_extraction,
+                context_label=f"extract_fingerprint_batch[{i}]",
+            )
 
             sentiment = _process_sentiment_result(
                 sentiment_results[i], article_text, save_debug=True
@@ -920,7 +978,10 @@ def extract_fingerprint(
             token_budget,
             clean_extraction[:240],
         )
-        extracted = _parse_extraction_structured(clean_extraction)
+        extracted = _parse_extraction_or_fallback(
+            clean_extraction,
+            context_label="extract_fingerprint",
+        )
 
         # Logits-based sentiment scoring.
         sentiment = _score_sentiment(article_text)
