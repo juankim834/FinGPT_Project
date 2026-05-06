@@ -1,8 +1,11 @@
 import math
 
+import pandas as pd
+
 from agent1.schema import NewsFingerprint
 from agent2.schema import TradingSignal
-from backtest.backtester import flatten_article_result
+from backtest.backtester import compute_metrics, flatten_article_result
+from backtest.dataset_parser import extract_article_text
 
 
 def _make_row() -> dict:
@@ -183,3 +186,38 @@ def test_flatten_article_result_uses_nan_for_malformed_numeric_fields():
     assert math.isnan(row["pmi_null_logprob_A"])
     assert math.isnan(row["pmi_adjusted_logit_A"])
     assert math.isnan(row["signal_prob_A"])
+
+
+def test_compute_metrics_marks_missing_fingpt_labels_explicitly():
+    metrics = compute_metrics(
+        pd.DataFrame(
+            [
+                {
+                    "ticker": "AAPL",
+                    "signal_direction": "long",
+                    "realized_return": 0.05,
+                    "strategy_return": 0.05,
+                    "fingpt_label": "no_label_provided",
+                    "signal_filter_forced_hold": False,
+                    "skipped_reason": "",
+                }
+            ]
+        )
+    )
+
+    assert metrics["vs_fingpt_accuracy"] == "no_label_provided"
+
+
+def test_extract_article_text_preserves_ticker_context():
+    prompt = (
+        "From 2026-01-02 to 2026-01-09\n"
+        "Ticker: AAPL\n"
+        "[Headline]: Apple launches a new product\n"
+        "[Summary]: Revenue impact is expected next quarter.\n"
+        "[Basic Financials]: N/A"
+    )
+
+    article_text = extract_article_text(prompt)
+
+    assert article_text.startswith("Ticker: AAPL")
+    assert "Headline: Apple launches a new product" in article_text

@@ -93,6 +93,13 @@ def extract_article_text(input_prompt: str) -> str:
     text = _INST_TAG_RE.sub(" ", text)
     text = text.strip()
 
+    ticker_match = re.search(r"(^|\n)\s*Ticker:\s*([^\n]+)", text, re.IGNORECASE)
+    ticker_line = ""
+    if ticker_match:
+        ticker_value = re.sub(r"\s+", " ", ticker_match.group(2)).strip()
+        if ticker_value:
+            ticker_line = f"Ticker: {ticker_value}"
+
     start_idx = text.find("[Headline]:")
     if start_idx < 0:
         return ""
@@ -117,12 +124,13 @@ def extract_article_text(input_prompt: str) -> str:
             if not h and not s:
                 continue
             rendered.append(f"News {idx}\nHeadline: {h}\nSummary: {s}")
-        return "\n\n".join(rendered).strip()
+        body = "\n\n".join(rendered).strip()
+        return f"{ticker_line}\n\n{body}".strip() if ticker_line else body
 
     # Fallback for prompts that don't strictly follow headline/summary pair format.
     news_block = re.sub(r"\[(Headline|Summary)\]:", " ", news_block, flags=re.IGNORECASE)
     news_block = re.sub(r"\s+", " ", news_block).strip()
-    return news_block
+    return f"{ticker_line}\n\n{news_block}".strip() if ticker_line else news_block
 
 
 def extract_primary_headline(input_prompt: str) -> str:
@@ -156,6 +164,8 @@ def parse_fingpt_label(answer: str) -> str:
     Normalize FinGPT answer label to up/down/neutral.
     """
     normalized = (answer or "").strip().lower()
+    if not normalized:
+        return "no_label_provided"
     if "up" in normalized:
         return "up"
     if "down" in normalized:

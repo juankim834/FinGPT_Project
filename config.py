@@ -130,7 +130,7 @@ FINGPT_EVENT_TYPE_MIN_MARGIN: float = float(
 #   adjusted_logit[t] = raw_logit[t] - pmi_alpha * null_logprob[t]
 # alpha=1.0 → full PMI correction (original behaviour).
 # alpha=0.0 → no PMI correction (raw logits only).
-FINGPT_PMI_ALPHA: float = float(os.getenv("FINGPT_PMI_ALPHA", "1.0"))
+FINGPT_PMI_ALPHA: float = float(os.getenv("FINGPT_PMI_ALPHA", "0.0"))
 
 # ---------------------------------------------------------------------------
 # Agent 2 — signal confidence / margin / direction filters

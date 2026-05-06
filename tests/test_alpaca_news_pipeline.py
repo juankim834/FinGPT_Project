@@ -120,6 +120,7 @@ def test_build_alpaca_backtest_dataset_groups_articles_by_week_and_marks_empty_w
     assert df.iloc[1]["skip_reason"] == "no_article_provided"
     assert df.iloc[1]["pass_reason"] == "no_article_provided"
     assert "From 2024-01-08 to 2024-01-16" in df.iloc[0]["input"]
+    assert "Ticker: AAPL" in df.iloc[0]["input"]
     assert "[Headline]: AI launch" in df.iloc[0]["input"]
     assert "[Headline]: AI follow-up" in df.iloc[0]["input"]
     assert "abcdefghijkl" in df.iloc[0]["input"]

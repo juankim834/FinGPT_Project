@@ -597,12 +597,18 @@ def compute_metrics(results: pd.DataFrame) -> dict:
 
     if "fingpt_label" in successful.columns and "signal_direction" in successful.columns:
         successful_fgt = successful.copy()
-        successful_fgt["fingpt_direction"] = successful_fgt["fingpt_label"].map(
-            {"up": "long", "down": "short", "neutral": "neutral"}
-        )
-        metrics["vs_fingpt_accuracy"] = float(
-            (successful_fgt["signal_direction"] == successful_fgt["fingpt_direction"]).mean()
-        )
+        valid_labels = {"up", "down", "neutral"}
+        labeled_mask = successful_fgt["fingpt_label"].isin(valid_labels)
+        if not labeled_mask.any():
+            metrics["vs_fingpt_accuracy"] = "no_label_provided"
+        else:
+            successful_fgt = successful_fgt[labeled_mask].copy()
+            successful_fgt["fingpt_direction"] = successful_fgt["fingpt_label"].map(
+                {"up": "long", "down": "short", "neutral": "neutral"}
+            )
+            metrics["vs_fingpt_accuracy"] = float(
+                (successful_fgt["signal_direction"] == successful_fgt["fingpt_direction"]).mean()
+            )
     else:
         metrics["vs_fingpt_accuracy"] = 0.0
 

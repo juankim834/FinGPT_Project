@@ -549,6 +549,7 @@ def _articles_to_prompt(
 
     input_text = (
         f"From {start_date} to {end_date}\n"
+        f"Ticker: {symbol}\n"
         f"{chr(10).join(segments)}\n"
         f"[Basic Financials]: N/A"
     )
