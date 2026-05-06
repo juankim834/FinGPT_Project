@@ -134,6 +134,11 @@ def _fetch_recent_articles_alpaca(
             "summary": item.get("summary", ""),
             "source": item.get("source", ""),
             "created_at": item.get("created_at", ""),
+            "source_ticker": (
+                item.get("symbols", [""])[0]
+                if isinstance(item.get("symbols"), list) and item.get("symbols")
+                else str(item.get("symbol", "") or "")
+            ),
         }
         for item in raw_news
     ]
@@ -180,6 +185,7 @@ def _fetch_recent_articles_finnhub(
                     "summary": item.get("summary", ""),
                     "source": item.get("source", ""),
                     "created_at": created_at,
+                    "source_ticker": ticker,
                 }
             )
 
@@ -206,7 +212,7 @@ def fetch_recent_articles(
 ) -> list[dict[str, Any]]:
     """
     Returns a list of article dicts with keys:
-        headline, summary, source, created_at
+        headline, summary, source, created_at, source_ticker
 
     Concatenate headline + summary as the article_text passed to Agent 1.
 

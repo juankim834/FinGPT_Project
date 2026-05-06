@@ -291,11 +291,13 @@ class TestAssembleFingerprint:
         assert fp.headline == "Apple Q2 earnings beat expectations"
         assert fp.event_type == "EARNINGS"
         assert fp.sentiment_label == "POSITIVE"
+        assert fp.ticker == ""
         assert "AAPL" in fp.companies_named
 
     def test_ticker_fallback_fills_empty_companies_named(self):
         extracted, sentiment, event_type = self._make_inputs(companies_named=[])
         fp = self.fn(extracted, sentiment, event_type, "article text", fallback_ticker="AAPL")
+        assert fp.ticker == "AAPL"
         assert fp.companies_named == ["AAPL"]
 
     def test_no_fallback_with_empty_companies_gives_empty(self):
@@ -312,4 +314,5 @@ class TestAssembleFingerprint:
     def test_existing_companies_not_overridden_by_fallback(self):
         extracted, sentiment, event_type = self._make_inputs(companies_named=["MSFT"])
         fp = self.fn(extracted, sentiment, event_type, "article text", fallback_ticker="AAPL")
+        assert fp.ticker == "AAPL"
         assert fp.companies_named == ["MSFT"]

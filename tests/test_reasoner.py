@@ -38,6 +38,7 @@ def _make_fingerprint(
     event_type_method="logits_accepted",
 ) -> NewsFingerprint:
     return NewsFingerprint(
+        ticker="AAPL",
         source="test",
         published_at="2026-05-01T12:00:00Z",
         headline="Test headline for trading signal.",

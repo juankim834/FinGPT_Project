@@ -62,7 +62,10 @@ def collect_held_out_batch(
             logger.warning("[%d/%d] Skipped: Agent 1 failed (empty article text).", idx, len(articles))
             continue
 
-        fingerprint = extract_fingerprint(article_text)
+        fingerprint = extract_fingerprint(
+            article_text,
+            ticker=str(article.get("source_ticker", "") or ""),
+        )
         if fingerprint is None:
             skipped_agent1 += 1
             logger.warning("[%d/%d] Skipped: Agent 1 failed.", idx, len(articles))

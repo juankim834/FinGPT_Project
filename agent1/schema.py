@@ -34,6 +34,7 @@ class NewsFingerprint(BaseModel):
     # -----------------------------------------------------------------------
     # Fact-extraction fields
     # -----------------------------------------------------------------------
+    ticker: str
     source: str
     published_at: str
     headline: str

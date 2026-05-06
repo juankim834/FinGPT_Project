@@ -39,7 +39,10 @@ def run_pipeline(
         article_text = article["headline"] + " " + article.get("summary", "")
         logger.info("[%d/%d] Extracting fingerprint...", i, len(articles))
 
-        fingerprint = extract_fingerprint(article_text)
+        fingerprint = extract_fingerprint(
+            article_text,
+            ticker=str(article.get("source_ticker", "") or ""),
+        )
         if fingerprint is None:
             logger.info("[%d/%d] Fingerprint extraction failed — skipping.", i, len(articles))
             continue

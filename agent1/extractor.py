@@ -4,7 +4,7 @@ agent1/extractor.py — Agent 1: FinGPT fact extractor + logits-based sentiment 
 Pipeline per article
 --------------------
 1. Fact extraction  — guided-decoding vLLM call → JSON (source, headline, …).
-2. Sentiment scoring — CoT vLLM call → real token logprobs for
+2. Sentiment scoring — direct vLLM scoring → real token logprobs for
                        [POSITIVE, NEGATIVE, NEUTRAL].
 3. Event type scoring — direct scoring vLLM call → real token logprobs for
                        [A, B, C, D, E, F, G] mapped to concrete event categories.
@@ -41,7 +41,7 @@ from agent1.prompt import (
     EVENT_TYPE_DECISION_PREFIX,
     EVENT_TYPE_PROMPT,
     EXTRACTION_PROMPT,
-    SENTIMENT_COT_PROMPT,
+    SENTIMENT_PROMPT,
     SENTIMENT_DECISION_PREFIX,
 )
 from agent1.schema import NewsFingerprint, SentimentLabel, _SENTIMENT_SCORE
@@ -604,9 +604,8 @@ def _score_sentiment(article_text: str) -> dict[str, Any]:
     """
     Extract real model log-probabilities for each sentiment class.
 
-    Two vLLM calls (handled inside get_real_choice_logits):
-      Phase 1 — CoT generation (stop at </think>).
-      Phase 2 — prompt_logprobs scoring of POSITIVE / NEGATIVE / NEUTRAL.
+    Uses direct prompt_logprobs scoring of POSITIVE / NEGATIVE / NEUTRAL
+    without a chain-of-thought generation phase.
 
     Output logic is fully delegated to ``_process_sentiment_result``.
     """
@@ -617,16 +616,17 @@ def _score_sentiment(article_text: str) -> dict[str, Any]:
             "Ensure FINGPT_MODEL_PATH is set before calling extract_fingerprint."
         )
 
-    cot_user_content = SENTIMENT_COT_PROMPT.format(article_text=article_text)
-    cot_prompt = _format_chat_prompt("", cot_user_content)
+    prompt_text = SENTIMENT_PROMPT.format(article_text=article_text)
+    prompt = _format_chat_prompt("", prompt_text)
 
     result = get_real_choice_logits(
         engine=_vllm_engine,
-        cot_prompt=cot_prompt,
+        cot_prompt=prompt,
         choices=SENTIMENT_CLASSES,
         decision_prefix=SENTIMENT_DECISION_PREFIX,
         tokenizer=_chat_tokenizer,
-        max_cot_tokens=LOGITS_MAX_TOKENS,
+        max_cot_tokens=0,
+        use_cot=False,
     )
     return _process_sentiment_result(result, article_text)
 
@@ -681,8 +681,10 @@ def _assemble_fingerprint(
     """
     Build a ``NewsFingerprint`` from fact-extraction, sentiment, and event_type dicts.
 
+    ``ticker`` is carried separately from the extracted company mentions.
     If ``companies_named`` is empty and ``fallback_ticker`` is provided,
-    the ticker is substituted to avoid dropping otherwise valid rows.
+    the ticker is also substituted into ``companies_named`` to avoid
+    dropping otherwise valid rows.
     ``event_keywords`` is set to ``[event_type]`` for backward compatibility.
     """
     companies_named = extracted.get("companies_named", [])
@@ -694,6 +696,7 @@ def _assemble_fingerprint(
 
     et = event_type.get("event_type", "OTHER")
     payload: dict[str, Any] = {
+        "ticker": fallback_ticker or "",
         "source": extracted.get("source", ""),
         "published_at": extracted.get("published_at", ""),
         "headline": extracted.get("headline", ""),
@@ -736,9 +739,9 @@ def extract_fingerprint_batch(
     """
     Batch version of ``extract_fingerprint``.
 
-    Sends all articles to vLLM in **three batched call-pairs**:
+    Sends all articles to vLLM in three batched inference groups:
       1. Guided fact-extraction call (all articles, single ``SamplingParams``).
-      2. Sentiment CoT + logits call (all articles, single ``SamplingParams``).
+      2. Sentiment direct logits call (all articles, single ``SamplingParams``).
       3. Event type direct logits call (all articles, single ``SamplingParams``).
 
     Per-item output logic (softmax, argmax, ``NewsFingerprint`` assembly) is
@@ -795,18 +798,19 @@ def extract_fingerprint_batch(
         o.outputs[0].text if o.outputs else "" for o in ext_outputs
     ]
 
-    # --- Step 2: Batch real logprobs for sentiment (2 vLLM calls internally) ---
-    cot_prompts = [
-        _format_chat_prompt("", SENTIMENT_COT_PROMPT.format(article_text=t))
+    # --- Step 2: Batch real logprobs for sentiment (single scoring call) ---
+    sentiment_prompts = [
+        _format_chat_prompt("", SENTIMENT_PROMPT.format(article_text=t))
         for t in article_texts
     ]
     sentiment_results = get_real_choice_logits_batch(
         engine=_vllm_engine,
-        cot_prompts=cot_prompts,
+        cot_prompts=sentiment_prompts,
         choices=SENTIMENT_CLASSES,
         decision_prefix=SENTIMENT_DECISION_PREFIX,
         tokenizer=_chat_tokenizer,
-        max_cot_tokens=LOGITS_MAX_TOKENS,
+        max_cot_tokens=0,
+        use_cot=False,
     )
 
     # --- Step 3: Batch real logprobs for event_type (1 vLLM call — no CoT) ---

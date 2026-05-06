@@ -54,18 +54,17 @@ SYSTEM_PROMPT: str = EXTRACTION_PROMPT
 # Sentiment CoT prompt (Phase 1 — reasoning only, no answer expected)
 # ---------------------------------------------------------------------------
 
-SENTIMENT_COT_PROMPT: str = """\
+SENTIMENT_PROMPT: str = """\
 You are a financial news sentiment analyst.
 
-Reason step by step about the market sentiment conveyed by the following \
-article. Write your analysis inside <think>...</think> tags. Consider:
-
-• Which companies or sectors are mentioned and how are they affected?
-• Is the news fundamentally positive, negative, or neutral for investors?
-• Are there conflicting signals or ambiguity in the article?
+Read the following article and classify the market sentiment for investors.
+Use the article as the only source of truth.
 
 {article_text}\
 """
+
+# Backward-compatible alias for older imports.
+SENTIMENT_COT_PROMPT: str = SENTIMENT_PROMPT
 
 # ---------------------------------------------------------------------------
 # Decision prefix (Phase 2 — appended after </think> for logprob scoring)

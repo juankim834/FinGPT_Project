@@ -37,6 +37,8 @@ def _make_base_result(row: dict) -> dict:
     nan = math.nan
     return {
         "ticker": row["ticker"],
+        "fingerprint_ticker": None,
+        "signal_ticker": None,
         "start_date": row["start_date"],
         "end_date": row["end_date"],
         "article_text": row["article_text"][:120],
@@ -121,6 +123,7 @@ def flatten_article_result(
     result = _make_base_result(row)
 
     if fingerprint is not None:
+        result["fingerprint_ticker"] = fingerprint.ticker
         result["sentiment_label"] = fingerprint.sentiment_label
         result["sentiment_score"] = float(fingerprint.sentiment_score)
         result["sentiment_confidence"] = float(fingerprint.sentiment_confidence)
@@ -168,6 +171,7 @@ def flatten_article_result(
         )
 
     if signal is not None:
+        result["signal_ticker"] = signal.ticker
         result["direction"] = signal.direction
         result["confidence"] = float(signal.confidence)
         result["raw_signal_logprob_A"] = _safe_list_item(signal.raw_signal_logits, 0)
@@ -213,7 +217,7 @@ def run_backtest(
     vLLM inference runs in batches of ``batch_size`` (default from config).
     Each batch makes these vLLM call groups:
       1. Guided fact-extraction (all articles in the batch, single call).
-      2. Sentiment CoT + logits (all articles in the batch, single call).
+      2. Sentiment direct logits (all articles in the batch, single call).
       3. Event type direct logits (all articles in the batch, single call).
       4. Strategy logits (valid fingerprints only, single call; CoT optional).
 

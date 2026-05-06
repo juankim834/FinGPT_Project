@@ -17,6 +17,7 @@ def _make_row() -> dict:
 
 def _make_fingerprint() -> NewsFingerprint:
     return NewsFingerprint(
+        ticker="AAPL",
         source="Reuters",
         published_at="2026-05-01T12:00:00Z",
         headline="Apple beats expectations",
@@ -87,6 +88,9 @@ def test_flatten_article_result_exports_required_numeric_columns():
     )
 
     required_columns = [
+        "ticker",
+        "fingerprint_ticker",
+        "signal_ticker",
         "sentiment_label",
         "sentiment_score",
         "sentiment_confidence",
@@ -138,6 +142,8 @@ def test_flatten_article_result_exports_required_numeric_columns():
         assert column in row
 
     assert row["sentiment_logprob_POSITIVE"] == -0.2
+    assert row["fingerprint_ticker"] == "AAPL"
+    assert row["signal_ticker"] == "AAPL"
     assert row["event_logprob_A"] == -0.1
     assert row["raw_signal_logprob_A"] == -0.3
     assert row["pmi_null_logprob_A"] == -1.2

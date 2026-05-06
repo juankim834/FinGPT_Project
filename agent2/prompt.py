@@ -1,10 +1,12 @@
 """
 agent2/prompt.py — Prompts for Agent 2 (trading direction classifier).
 
-Agent 2 is a narrow direction classifier.  It receives only:
+Agent 2 is a narrow direction classifier. It receives only the structured
+Agent 1 fingerprint:
   - ticker and headline
-  - Agent 1's structured fingerprint (sentiment label + probabilities,
-    event_type + confidence/margin/method, companies_named)
+  - sentiment label + probabilities
+  - event_type + confidence/margin/method
+  - companies_named
 
 It does NOT re-read the full article text, re-extract event keywords,
 predict strategy_tag, or report self-assessed confidence.  All of those
@@ -43,7 +45,7 @@ STRATEGY_SCORE_TOKENS
 STRATEGY_PROMPT_NO_COT: str = """\
 You are a financial trading signal classifier.
 
-Given the headline and structured news fingerprint, choose one trading direction.
+Given the structured news fingerprint, choose one trading direction.
 
 Directions:
 A = BUY / long
@@ -69,7 +71,7 @@ Agent 1 fingerprint:
 STRATEGY_PROMPT_COT: str = """\
 You are a financial trading signal classifier.
 
-Given the headline and structured news fingerprint, reason step by step \
+Given the structured news fingerprint, reason step by step \
 about the appropriate one-week trading direction. Write ALL of your \
 reasoning inside <think>...</think> tags. Then choose one direction.
 

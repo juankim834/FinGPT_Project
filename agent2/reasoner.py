@@ -256,6 +256,7 @@ def _compute_null_logprobs() -> Optional[list[float]]:
         return cached
 
     null_fp = NewsFingerprint(
+        ticker="UNKNOWN",
         source="null",
         published_at="",
         headline="No specific news.",
@@ -328,7 +329,7 @@ def _build_prompt(fingerprint: NewsFingerprint) -> str:
     """
     template = STRATEGY_PROMPT_COT if FINGPT_SIGNAL_USE_COT else STRATEGY_PROMPT_NO_COT
 
-    ticker = fingerprint.companies_named[0] if fingerprint.companies_named else "UNKNOWN"
+    ticker = fingerprint.ticker or "UNKNOWN"
     sp = fingerprint.sentiment_probabilities or {}
     p_pos = round(sp.get("POSITIVE", 0.0), 4)
     p_neu = round(sp.get("NEUTRAL", 0.0), 4)
@@ -385,7 +386,7 @@ def _save_md_debug_output(
 
         identity = (
             f"{fingerprint.headline}|"
-            f"{fingerprint.companies_named[0] if fingerprint.companies_named else ''}"
+            f"{fingerprint.ticker or ''}"
         )
         fp_id = md5(identity.encode("utf-8")).hexdigest()[:12]
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -410,7 +411,7 @@ def _save_failure_diagnostic(fingerprint: NewsFingerprint, raw_output: str) -> N
 
         identity = (
             f"{fingerprint.headline}|"
-            f"{fingerprint.companies_named[0] if fingerprint.companies_named else 'UNKNOWN'}"
+            f"{fingerprint.ticker or 'UNKNOWN'}"
         )
         fp_id = md5(identity.encode("utf-8")).hexdigest()[:12]
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -526,7 +527,7 @@ def _process_signal_result(
     )
 
     thinking_text = result.get("thinking", "").strip()
-    ticker = fingerprint.companies_named[0] if fingerprint.companies_named else "UNKNOWN"
+    ticker = fingerprint.ticker or "UNKNOWN"
 
     if thinking_text:
         _log_thinking(thinking_text, ticker)
