@@ -25,6 +25,5 @@ dist/
 # VS Code
 .vscode/
 .DS_Store
-*.json
 backtesting_analysis/
 output/
