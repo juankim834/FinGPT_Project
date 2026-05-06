@@ -32,6 +32,14 @@ _DIRECTION_MAP = {
 }
 
 
+def _normalize_skipped_reason(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    return str(value).strip()
+
+
 def _coerce_float(value: object) -> Optional[float]:
     if value is None:
         return None
@@ -159,14 +167,15 @@ def apply_pmi_alpha_to_results(
         adjusted["strategy_return"] = math.nan
     if "skipped_reason" not in adjusted.columns:
         adjusted["skipped_reason"] = ""
+    adjusted["skipped_reason"] = adjusted["skipped_reason"].apply(_normalize_skipped_reason)
     for text_column in [
         "direction",
         "signal_direction",
         "signal_filter_reason",
-        "skipped_reason",
     ]:
         if text_column in adjusted.columns:
             adjusted[text_column] = adjusted[text_column].astype(object)
+    adjusted["skipped_reason"] = adjusted["skipped_reason"].astype(object)
 
     for idx in adjusted.index:
         row = adjusted.loc[idx]
@@ -207,7 +216,7 @@ def apply_pmi_alpha_to_results(
         position = _position_from_direction(str(processed["direction"]))
         adjusted.at[idx, "position"] = position
         adjusted.at[idx, "strategy_return"] = position * realized_return
-        skipped_reason = str(row.get("skipped_reason", "") or "")
+        skipped_reason = _normalize_skipped_reason(row.get("skipped_reason", ""))
         if skipped_reason == "price_fetch_failed":
             continue
         if skipped_reason in {"", "signal_failed"}:
@@ -316,6 +325,240 @@ def run_pmi_alpha_grid_search(
     return summary
 
 
+def run_signal_confidence_grid_search(
+    results_or_path: pd.DataFrame | str,
+    *,
+    confidence_levels: list[float],
+    pmi_alpha: float = FINGPT_PMI_ALPHA,
+    output_path: Optional[str] = None,
+    detailed_output_dir: Optional[str] = None,
+    calibration_t: float = CALIBRATION_T,
+    min_margin: float = FINGPT_SIGNAL_MIN_MARGIN,
+    buy_threshold: float = FINGPT_BUY_THRESHOLD,
+    sell_threshold: float = FINGPT_SELL_THRESHOLD,
+) -> pd.DataFrame:
+    """
+    Evaluate multiple minimum-confidence thresholds on an existing backtest CSV/DataFrame.
+    """
+    if isinstance(results_or_path, pd.DataFrame):
+        base_results = results_or_path.copy()
+    else:
+        base_results = pd.read_csv(results_or_path)
+
+    summary_rows: list[dict[str, object]] = []
+    original_direction = (
+        base_results["signal_direction"].astype(str)
+        if "signal_direction" in base_results.columns
+        else pd.Series([""] * len(base_results), index=base_results.index)
+    )
+
+    for min_confidence in confidence_levels:
+        adjusted = apply_pmi_alpha_to_results(
+            base_results,
+            pmi_alpha=pmi_alpha,
+            calibration_t=calibration_t,
+            min_confidence=min_confidence,
+            min_margin=min_margin,
+            buy_threshold=buy_threshold,
+            sell_threshold=sell_threshold,
+        )
+        metrics = compute_metrics(adjusted)
+        raw_signal_mask = adjusted[[
+            "raw_signal_logprob_A",
+            "raw_signal_logprob_B",
+            "raw_signal_logprob_C",
+        ]].notna().all(axis=1)
+        signal_rows = adjusted.loc[raw_signal_mask].copy()
+        signal_direction = signal_rows["signal_direction"].astype(str)
+        summary_row: dict[str, object] = {
+            "pmi_alpha": pmi_alpha,
+            "calibration_T": calibration_t,
+            "signal_min_confidence": min_confidence,
+            "signal_min_margin": min_margin,
+            "buy_threshold": buy_threshold,
+            "sell_threshold": sell_threshold,
+            "raw_rows": int(len(base_results)),
+            "signal_rows": int(len(signal_rows)),
+            "signal_long_count": int((signal_direction == "long").sum()),
+            "signal_short_count": int((signal_direction == "short").sum()),
+            "signal_neutral_count": int((signal_direction == "neutral").sum()),
+            "signal_changed_count": int(
+                (
+                    signal_rows["signal_direction"].astype(str)
+                    != original_direction.loc[signal_rows.index]
+                ).sum()
+            ),
+            "forced_hold_count": int(
+                signal_rows.get(
+                    "signal_filter_forced_hold",
+                    pd.Series(False, index=signal_rows.index, dtype=bool),
+                )
+                .astype(bool)
+                .sum()
+            ),
+        }
+        summary_row["signal_changed_rate"] = (
+            summary_row["signal_changed_count"] / summary_row["signal_rows"]
+            if summary_row["signal_rows"]
+            else 0.0
+        )
+        summary_row["forced_hold_rate"] = (
+            summary_row["forced_hold_count"] / summary_row["signal_rows"]
+            if summary_row["signal_rows"]
+            else 0.0
+        )
+        summary_row.update(metrics)
+        summary_rows.append(summary_row)
+
+        if detailed_output_dir:
+            os.makedirs(detailed_output_dir, exist_ok=True)
+            threshold_slug = str(min_confidence).replace("-", "neg_").replace(".", "_")
+            adjusted.to_csv(
+                os.path.join(
+                    detailed_output_dir,
+                    f"backtest_confidence_{threshold_slug}.csv",
+                ),
+                index=False,
+            )
+
+    summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        summary["rank_total_pnl"] = summary["total_pnl"].rank(
+            method="dense", ascending=False
+        )
+        summary["rank_sharpe"] = summary["annualized_sharpe"].rank(
+            method="dense", ascending=False
+        )
+        summary["rank_direction_accuracy"] = summary["direction_accuracy"].rank(
+            method="dense", ascending=False
+        )
+
+    if output_path:
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        summary.to_csv(output_path, index=False)
+
+    return summary
+
+
+def run_alpha_confidence_grid_search(
+    results_or_path: pd.DataFrame | str,
+    *,
+    alphas: list[float],
+    confidence_levels: list[float],
+    output_path: Optional[str] = None,
+    detailed_output_dir: Optional[str] = None,
+    calibration_t: float = CALIBRATION_T,
+    min_margin: float = FINGPT_SIGNAL_MIN_MARGIN,
+    buy_threshold: float = FINGPT_BUY_THRESHOLD,
+    sell_threshold: float = FINGPT_SELL_THRESHOLD,
+) -> pd.DataFrame:
+    """
+    Jointly evaluate PMI alpha and minimum-confidence threshold combinations.
+    """
+    if isinstance(results_or_path, pd.DataFrame):
+        base_results = results_or_path.copy()
+    else:
+        base_results = pd.read_csv(results_or_path)
+
+    summary_rows: list[dict[str, object]] = []
+    original_direction = (
+        base_results["signal_direction"].astype(str)
+        if "signal_direction" in base_results.columns
+        else pd.Series([""] * len(base_results), index=base_results.index)
+    )
+
+    for alpha in alphas:
+        for min_confidence in confidence_levels:
+            adjusted = apply_pmi_alpha_to_results(
+                base_results,
+                pmi_alpha=alpha,
+                calibration_t=calibration_t,
+                min_confidence=min_confidence,
+                min_margin=min_margin,
+                buy_threshold=buy_threshold,
+                sell_threshold=sell_threshold,
+            )
+            metrics = compute_metrics(adjusted)
+            raw_signal_mask = adjusted[[
+                "raw_signal_logprob_A",
+                "raw_signal_logprob_B",
+                "raw_signal_logprob_C",
+            ]].notna().all(axis=1)
+            signal_rows = adjusted.loc[raw_signal_mask].copy()
+            signal_direction = signal_rows["signal_direction"].astype(str)
+            forced_hold_series = signal_rows.get(
+                "signal_filter_forced_hold",
+                pd.Series(False, index=signal_rows.index, dtype=bool),
+            ).astype(bool)
+
+            summary_row: dict[str, object] = {
+                "pmi_alpha": alpha,
+                "calibration_T": calibration_t,
+                "signal_min_confidence": min_confidence,
+                "signal_min_margin": min_margin,
+                "buy_threshold": buy_threshold,
+                "sell_threshold": sell_threshold,
+                "raw_rows": int(len(base_results)),
+                "signal_rows": int(len(signal_rows)),
+                "signal_long_count": int((signal_direction == "long").sum()),
+                "signal_short_count": int((signal_direction == "short").sum()),
+                "signal_neutral_count": int((signal_direction == "neutral").sum()),
+                "signal_changed_count": int(
+                    (
+                        signal_rows["signal_direction"].astype(str)
+                        != original_direction.loc[signal_rows.index]
+                    ).sum()
+                ),
+                "forced_hold_count": int(forced_hold_series.sum()),
+            }
+            summary_row["signal_changed_rate"] = (
+                summary_row["signal_changed_count"] / summary_row["signal_rows"]
+                if summary_row["signal_rows"]
+                else 0.0
+            )
+            summary_row["forced_hold_rate"] = (
+                summary_row["forced_hold_count"] / summary_row["signal_rows"]
+                if summary_row["signal_rows"]
+                else 0.0
+            )
+            summary_row.update(metrics)
+            summary_rows.append(summary_row)
+
+            if detailed_output_dir:
+                os.makedirs(detailed_output_dir, exist_ok=True)
+                alpha_slug = str(alpha).replace("-", "neg_").replace(".", "_")
+                confidence_slug = str(min_confidence).replace("-", "neg_").replace(".", "_")
+                adjusted.to_csv(
+                    os.path.join(
+                        detailed_output_dir,
+                        f"backtest_alpha_{alpha_slug}_confidence_{confidence_slug}.csv",
+                    ),
+                    index=False,
+                )
+
+    summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        summary["rank_total_pnl"] = summary["total_pnl"].rank(
+            method="dense", ascending=False
+        )
+        summary["rank_sharpe"] = summary["annualized_sharpe"].rank(
+            method="dense", ascending=False
+        )
+        summary["rank_direction_accuracy"] = summary["direction_accuracy"].rank(
+            method="dense", ascending=False
+        )
+
+    if output_path:
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        summary.to_csv(output_path, index=False)
+
+    return summary
+
+
 def parse_alpha_grid(alpha_spec: str) -> list[float]:
     """
     Parse a comma-separated alpha list like ``"0,0.25,0.5,1.0"``.
@@ -329,3 +572,18 @@ def parse_alpha_grid(alpha_spec: str) -> list[float]:
     if not alphas:
         return [FINGPT_PMI_ALPHA]
     return alphas
+
+
+def parse_confidence_grid(level_spec: str) -> list[float]:
+    """
+    Parse a comma-separated confidence threshold list like ``"0.3,0.35,0.4"``.
+    """
+    levels: list[float] = []
+    for chunk in level_spec.split(","):
+        stripped = chunk.strip()
+        if not stripped:
+            continue
+        levels.append(float(stripped))
+    if not levels:
+        return [FINGPT_SIGNAL_MIN_CONFIDENCE]
+    return levels

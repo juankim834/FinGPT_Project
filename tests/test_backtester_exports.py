@@ -12,6 +12,7 @@ def _make_row() -> dict:
         "end_date": "2026-05-08",
         "article_text": "Apple beats earnings expectations and raises guidance.",
         "fingpt_label": "up",
+        "pass_reason": "",
     }
 
 
@@ -136,6 +137,7 @@ def test_flatten_article_result_exports_required_numeric_columns():
         "calibration_T",
         "signal_filter_forced_hold",
         "signal_filter_reason",
+        "pass_reason",
     ]
 
     for column in required_columns:

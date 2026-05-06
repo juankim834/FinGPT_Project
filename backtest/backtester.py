@@ -48,6 +48,8 @@ def _normalize_optional_text(value: object) -> str:
 def _has_signal_for_pricing(row: pd.Series) -> bool:
     signal_direction = _normalize_optional_text(row.get("signal_direction", ""))
     direction = _normalize_optional_text(row.get("direction", ""))
+    if signal_direction == "no_signal" or direction == "no_signal":
+        return False
     return bool(signal_direction or direction)
 
 
@@ -114,6 +116,7 @@ def _make_base_result(row: dict) -> dict:
         "realized_return": None,
         "position": None,
         "strategy_return": None,
+        "pass_reason": row.get("pass_reason", ""),
         "skipped_reason": "",
         "price_fetch_error_reason": "",
     }
@@ -225,6 +228,16 @@ def flatten_article_result(
     return result
 
 
+def _apply_no_signal_result(base_result: dict, row: dict) -> dict:
+    base_result["direction"] = "no_signal"
+    base_result["signal_direction"] = "no_signal"
+    base_result["strategy_tag"] = "none"
+    base_result["signal_ticker"] = row.get("ticker")
+    base_result["pass_reason"] = row.get("pass_reason") or "no_article_provided"
+    base_result["skipped_reason"] = row.get("skip_reason") or "no_article_provided"
+    return base_result
+
+
 def run_backtest(
     dataset_path: str,
     output_path: str = "output/backtest_results.csv",
@@ -278,20 +291,35 @@ def run_backtest(
             "Backtest progress: rows %d-%d / %d", batch_start + 1, batch_end, total
         )
 
+        skip_mask = [bool(r.get("skip_llm")) for r in batch]
         batch_tickers = [r["ticker"] for r in batch]
 
-        try:
-            fingerprints = extract_fingerprint_batch(
-                [r["article_text"] for r in batch],
-                tickers=batch_tickers,
-                headlines=[r.get("headline", "") for r in batch],
-            )
-        except Exception as exc:
-            logger.exception(
-                "extract_fingerprint_batch failed for rows %d-%d: %s",
-                batch_start + 1, batch_end, exc,
-            )
-            fingerprints = [None] * len(batch)
+        active_articles = [r["article_text"] for idx, r in enumerate(batch) if not skip_mask[idx]]
+        active_tickers = [ticker for idx, ticker in enumerate(batch_tickers) if not skip_mask[idx]]
+        active_headlines = [r.get("headline", "") for idx, r in enumerate(batch) if not skip_mask[idx]]
+
+        if active_articles:
+            try:
+                fingerprints = extract_fingerprint_batch(
+                    active_articles,
+                    tickers=active_tickers,
+                    headlines=active_headlines,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "extract_fingerprint_batch failed for rows %d-%d: %s",
+                    batch_start + 1, batch_end, exc,
+                )
+                fingerprints = [None] * len(active_articles)
+        else:
+            fingerprints = []
+
+        expanded_fingerprints: list = [None] * len(batch)
+        fp_iter = iter(fingerprints)
+        for idx, skipped in enumerate(skip_mask):
+            if not skipped:
+                expanded_fingerprints[idx] = next(fp_iter, None)
+        fingerprints = expanded_fingerprints
 
         if FINGPT_BACKTEST_STRICT_MODE:
             for j, fp in enumerate(fingerprints):
@@ -325,6 +353,10 @@ def run_backtest(
             base_result = flatten_article_result(row, fingerprint=fingerprint, signal=signal)
 
             try:
+                if row.get("skip_llm"):
+                    results.append(_apply_no_signal_result(base_result, row))
+                    continue
+
                 if fingerprint is None:
                     base_result["skipped_reason"] = "fingerprint_failed"
                     results.append(base_result)

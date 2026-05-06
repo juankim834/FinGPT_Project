@@ -1,344 +1,121 @@
-# FinGPT Part 2 开发文档
+# FinGPT Part 2 项目概述
 
-这份文档是 `DEVELOPMENT.md` 的中文版本，重点说明当前仓库的真实工作流、每一次 LLM 调用分别在做什么，以及回测系统如何把两阶段模型串起来。
+本文是当前仓库实现的中文开发摘要，对应英文版 [DEVELOPMENT.md](/C:/Project/FinGPT/FinGPT_Part2/DEVELOPMENT.md)。内容以当前代码与 `output/` 中已生成的结果为准，重点说明真实工作流、Dashboard，以及当前回测表现。
 
-## 项目目标
+## 1. 项目目标
 
-这个项目实现了一条本地运行的金融新闻信号流水线：
+这个项目实现了一条本地运行的两阶段金融新闻信号流水线：
 
-1. `Agent 1` 把原始新闻文本变成结构化指纹 `NewsFingerprint`
-2. `Agent 2` 基于指纹生成交易方向 `TradingSignal`
-3. `backtest` 模块把同样的流程跑在历史数据集上，并与真实收益对比
+1. `Agent 1` 读取新闻文本，生成结构化 `NewsFingerprint`
+2. `Agent 2` 基于 fingerprint 生成交易方向 `TradingSignal`
+3. `backtest` 模块把同样逻辑跑在历史数据集上，并计算收益与诊断指标
 
-这个仓库最核心的设计不是让模型“自己报分数”，而是通过 vLLM 的 `prompt_logprobs` 直接读取模型在决策点上的真实 token 对数概率，再由 Python 做确定性的后处理。
+核心设计不是让模型“自己报分”，而是直接读取 vLLM `prompt_logprobs` 中的真实 token 对数概率，再由 Python 做确定性后处理、校准和过滤。
 
-## 整体工作流
+## 2. 当前代码结构
 
-当前主要有两种运行模式。
+- [pipeline.py](/C:/Project/FinGPT/FinGPT_Part2/pipeline.py)：实时抓取新闻并串联 Agent 1 / Agent 2
+- [agent1/extractor.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/extractor.py)：抽取、情绪打分、事件类型打分
+- [agent1/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/schema.py)：`NewsFingerprint`
+- [agent2/reasoner.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/reasoner.py)：交易信号、PMI 校正、过滤规则
+- [agent2/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/schema.py)：`TradingSignal`
+- [backtest/backtester.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/backtester.py)：端到端回测、重定价、指标统计
+- [backtest/pmi_grid_search.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/pmi_grid_search.py)：离线 `pmi_alpha` / `confidence` 网格搜索
+- [backtest/dataset_parser.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/dataset_parser.py)：数据集解析与规范化
+- [ingestion/news_fetcher.py](/C:/Project/FinGPT/FinGPT_Part2/ingestion/news_fetcher.py)：Alpaca / Finnhub 新闻抓取
 
-### 1. 实时抓取模式
+## 3. 端到端工作流
 
-入口文件是 [pipeline.py](/C:/Project/FinGPT/FinGPT_Part2/pipeline.py)。
+### 3.1 实时模式
 
-流程如下：
-
-1. 调用 `run_pipeline(tickers, limit, as_of_timestamp)`
-2. 调用 `fetch_recent_articles(...)` 从 Alpaca 或 Finnhub 抓候选新闻
-3. 在抓取层做 leakage-safe 过滤：
-   - 只保留 `created_at <= as_of_timestamp` 的新闻
-   - 丢掉没有时间戳或时间戳无法解析的新闻
-   - 对每个 ticker 只保留该时点之前最近的一篇
-4. 对保留下来的每篇新闻：
-   - 构造 `article_text = headline + summary`
-   - 调用 `extract_fingerprint(article_text, ticker=..., headline=...)`
-   - 再调用 `generate_signal(fingerprint)`
-5. 把有效信号写入 `output/signals_<timestamp>.json`
-
-实时模式下有两个重要规则：
-
-- `ticker` 由抓取层提供，是外部确定信息
-- `headline` 也由抓取层提供，是外部确定信息
-- `Agent 2` 不会重新阅读新闻正文
-
-### 2. 回测模式
-
-入口文件是 [backtest/backtester.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/backtester.py)。
+入口是 [pipeline.py](/C:/Project/FinGPT/FinGPT_Part2/pipeline.py) 的 `run_pipeline(...)`。
 
 流程如下：
 
-1. 读取数据集，可以是：
-   - Hugging Face dataset
-   - 本地 `.csv`
-   - 本地 `.parquet`
-2. 统一列名为：
-   - `input`
-   - `output`
-   - `answer`
-   - `ticker`
-3. 解析成回测行，每行包含：
+1. 从 Alpaca 或 Finnhub 抓取候选新闻
+2. 在抓取层做 leakage-safe 过滤
+3. 每个 ticker 只保留目标时点之前最近的一篇新闻
+4. `Agent 1` 生成 `NewsFingerprint`
+5. `Agent 2` 生成 `TradingSignal`
+6. 输出到 `output/signals_<timestamp>.json`
+
+当前实时模式的关键约束：
+
+- `ticker` 与 `headline` 由上游抓取层提供
+- `Agent 2` 不直接重读完整新闻正文
+- 默认每个 ticker 只使用一篇最新可用新闻
+
+### 3.2 回测模式
+
+入口是 [backtest/run_backtest.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/run_backtest.py) 与 [backtest/backtester.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/backtester.py)。
+
+流程如下：
+
+1. 读取 Hugging Face 数据集，或本地 `.csv` / `.parquet`
+2. 统一列名为 `input`、`output`、`answer`、`ticker`
+3. 解析出：
    - `ticker`
    - `headline`
    - `article_text`
    - `start_date`
    - `end_date`
    - `fingpt_label`
-4. 以 batch 的方式运行：
-   - Agent 1 批量提取
+4. 按 batch 运行：
+   - Agent 1 批量抽取
    - Agent 2 批量打信号
-   - 真实收益抓取
-   - 行级结果拼装
-5. 输出详细 CSV
+   - yfinance 抓取真实区间收益
+   - 结果扁平化写入 CSV
 
-回测模式下有一个特别重要的规则：
+回测默认是“宽容模式”：
 
-- 对 HF 数据集中一条 prompt 里出现多篇新闻的情况，当前会取第一篇 headline 作为该样本的原始 `headline`
-- 数据集里的 `ticker` 会直接传给 Agent 1，作为权威 ticker
+- `fingerprint_failed` 会跳过该行
+- `event_type_logits_failed` 默认退化为 `OTHER`
+- `signal_failed` 会跳过该行
+- `price_fetch_failed` 会保留前面结果，但该行不计入成功样本
 
-## 核心数据结构
+## 4. 两个 Agent 实际在做什么
 
-### `NewsFingerprint`
+### 4.1 Agent 1
 
-定义在 [agent1/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/schema.py)。
+`Agent 1` 最终输出 [agent1/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/schema.py) 中定义的 `NewsFingerprint`，其中最重要的字段包括：
 
-字段分为几组：
+- 元数据：`ticker`、`headline`、`source`、`published_at`
+- 情绪：`sentiment_label`、`sentiment_confidence`、`sentiment_probabilities`
+- 事件：`event_type`、`event_type_confidence`、`event_type_margin`
+- 透传：`article_text`
 
-#### 元数据 / 上游传入字段
+当前实现里它实际上包含 3 次独立 LLM 调用：
 
-- `ticker`
-- `source`
-- `published_at`
-- `headline`
-- `companies_named`
-- `event_keywords`
+1. guided extraction：抽 `source` / `published_at` / `companies_named`
+2. sentiment scoring：直接对 `POSITIVE` / `NEGATIVE` / `NEUTRAL` 打分
+3. event-type scoring：直接对 `A-G` 七类事件 token 打分
 
-#### 情绪字段
+注意：
 
-- `sentiment_label`
-- `sentiment_score`
-- `sentiment_confidence`
-- `sentiment_probabilities`
-- `sentiment_logits`
-- `calibration_T`
+- `ticker` 不再依赖 `companies_named[0]`
+- `headline` 优先保留上游传入值
+- `OTHER` 不是模型输出，而是 Python 阈值规则赋值
 
-#### 事件类型字段
+### 4.2 Agent 2
 
-- `event_type`
-- `event_type_confidence`
-- `event_type_margin`
-- `event_type_method`
-- `event_type_logits`
-- `event_type_probabilities`
-- `secondary_event_type`
-- `secondary_event_type_confidence`
+`Agent 2` 最终输出 [agent2/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/schema.py) 中定义的 `TradingSignal`，关键字段包括：
 
-#### 透传字段
-
-- `article_text`
-
-几个关键行为：
-
-- `ticker` 现在不再依赖 `companies_named[0]`
-- `headline` 优先保留上游传入的原始 headline
-- `source` / `published_at` 如果模型抽成了 list，会在组装前归一化成单个字符串
-- `companies_named` 如果为空，会尽量用上游 `ticker` 补进去
-- `event_keywords` 现在主要是兼容字段，组装时会被设置成 `[event_type.lower()]`
-
-### `TradingSignal`
-
-定义在 [agent2/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/schema.py)。
-
-核心字段包括：
-
-- `ticker`
-- `direction`
-- `strategy_tag`
+- `direction`：`long` / `neutral` / `short`
 - `confidence`
-- `cot`
-- `signal_logits`
 - `raw_signal_logits`
 - `pmi_null_logprobs`
-- `pmi_alpha_used`
+- `signal_logits`：PMI 调整后的 logits
 - `signal_probabilities`
-- `calibration_T`
 - `signal_filter_forced_hold`
 - `signal_filter_reason`
 
-其中：
-
-- `strategy_tag` 目前固定为 `"event_driven"`
-- `cot` 在 no-CoT 模式下是空字符串
-
-## 每一次 LLM 调用到底在做什么
-
-这一节是最重要的。
-
-### Agent 1 调用 1：guided fact extraction
-
-代码位置：
-
-- [agent1/extractor.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/extractor.py)
-
-Prompt 来源：
-
-- [agent1/prompt.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/prompt.py) 中的 `EXTRACTION_PROMPT`
-
-输入：
-
-- 原始 `article_text`
-
-要求模型输出的结构化字段：
-
-- `source`
-- `published_at`
-- `companies_named`
-- `event_keywords`
-
-执行机制：
-
-1. 用 `EXTRACTION_PROMPT + article_text` 组成 extraction prompt
-2. 用 guided schema 要求模型输出 JSON
-3. 解析顺序是：
-   - 先按 JSON 解析
-   - 再尝试抽平衡的大括号 JSON
-   - 再尝试 markdown 风格 fallback
-
-当前的稳健性处理：
-
-- 如果 extraction 输出完全坏掉，已经不会直接让整条样本失败
-- 现在会退化成一个空的 extraction payload：
-  - `source=""`
-  - `published_at=""`
-  - `headline=""`
-  - `companies_named=[]`
-  - `event_keywords=[]`
-
-为什么这样仍然可以继续回测：
-
-- `source` 不影响 Agent 2
-- `headline` 通常已有外部传入值
-- `ticker` 通常已有外部传入值
-- `companies_named` 可以用 `ticker` fallback
-
-### Agent 1 调用 2：sentiment scoring
-
-代码位置：
-
-- [agent1/extractor.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/extractor.py) 中的 `_score_sentiment`
-
-Prompt 来源：
-
-- [agent1/prompt.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/prompt.py) 中的 `SENTIMENT_PROMPT`
-
-输入：
-
-- 原始 `article_text`
-
-模型候选输出标签：
-
-- `POSITIVE`
-- `NEGATIVE`
-- `NEUTRAL`
-
-执行机制：
-
-1. 构造直接分类的 sentiment prompt
-2. 调 `get_real_choice_logits(...)` 或 batch 版本
-3. 指定：
-   - `decision_prefix = "Sentiment: "`
-   - `use_cot = False`
-4. 从决策点读取三个类标签的真实 token log-probabilities
-5. 用 `softmax(logits / CALIBRATION_T)` 计算概率
-6. 生成：
-   - `sentiment_label`
-   - `sentiment_confidence`
-   - `sentiment_probabilities`
-   - `sentiment_logits`
-
-当前的降级逻辑：
-
-- 如果 sentiment logits 解析失败
-- 不会让整条样本中断
-- 会退化成：
-  - 均匀概率
-  - `NEUTRAL`
-  - 零 logits
-
-### Agent 1 调用 3：event_type scoring
-
-代码位置：
-
-- [agent1/extractor.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/extractor.py) 中的 `_score_event_type`
-
-Prompt 来源：
-
-- [agent1/prompt.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/prompt.py) 中的 `EVENT_TYPE_PROMPT`
-
-输入：
-
-- 原始 `article_text`
-
-模型评分 token：
-
-- `A`, `B`, `C`, `D`, `E`, `F`, `G`
-
-映射关系：
-
-- `A -> EARNINGS`
-- `B -> GUIDANCE`
-- `C -> ANALYST_RATING`
-- `D -> LEGAL_REGULATORY`
-- `E -> MNA`
-- `F -> PRODUCT_BUSINESS`
-- `G -> MACRO`
-
-执行机制：
-
-1. 构造 event-type prompt
-2. 调 `get_real_choice_logits(...)` 或 batch 版本
-3. 指定：
-   - `decision_prefix = "Answer: "`
-   - `use_cot = False`
-4. 读取 A-G 的真实 token log-probabilities
-5. 用 `softmax(logits / CALIBRATION_T)` 做概率校准
-6. 找 top-1 / top-2
-7. 应用规则过滤：
-   - 如果 `top_prob < FINGPT_EVENT_TYPE_MIN_CONFIDENCE`，输出 `OTHER`
-   - 如果 `margin < FINGPT_EVENT_TYPE_MIN_MARGIN`，输出 `OTHER`
-   - 否则接受 top 类别
-
-重要设计：
-
-- `OTHER` 不是模型打分出来的
-- `OTHER` 只由 Python 规则引擎赋值
-
-### Agent 2 调用 1：PMI null-context prior
-
-代码位置：
-
-- [agent2/reasoner.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/reasoner.py) 中的 `_compute_null_logprobs`
-
-作用：
-
-- 计算在没有真实新闻语境时，模型对 A/B/C 三个策略 token 的先验偏好
-
-执行机制：
-
-1. 构造一个合成的中性 `NewsFingerprint`
-2. 构造 Agent 2 prompt
-3. 对 A/B/C 打分
-4. 结果存入：
-   - 进程内缓存
-   - 可选的磁盘缓存
-
-这个调用不是每篇新闻都跑，而是每组模型/配置组合只跑一次。
-
-### Agent 2 调用 2：strategy scoring
-
-代码位置：
-
-- [agent2/reasoner.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/reasoner.py)
-
-Prompt 来源：
-
-- [agent2/prompt.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/prompt.py)
-
-Agent 2 实际看到的输入：
-
-- `ticker`
-- `headline`
-- Agent 1 输出的 sentiment 字段
-- Agent 1 输出的 event_type 字段
-- `companies_named`
-
-Agent 2 明确看不到：
-
-- 完整 `article_text`
-- 新闻正文
-- 旧的 event keyword 抽取结果
-
-模型评分 token：
-
-- `A`, `B`, `C`
+当前逻辑：
+
+1. 用 fingerprint 信息构造紧凑 prompt
+2. 对 `A/B/C` 三个策略 token 取真实 logprob
+3. 如果启用 PMI，则按 `adjusted = raw - pmi_alpha * null` 修正
+4. 经 `CALIBRATION_T=1.2` 做 softmax 校准
+5. 再经过 confidence / margin / buy / sell 阈值过滤
 
 映射关系：
 
@@ -346,190 +123,234 @@ Agent 2 明确看不到：
 - `B -> HOLD -> neutral`
 - `C -> SELL -> short`
 
-执行机制：
+## 5. 当前配置重点
 
-1. 构造 compact fingerprint-only prompt
-2. 如果 `FINGPT_SIGNAL_USE_COT=True`
-   - 先生成 CoT
-   - 再对 A/B/C 打分
-3. 否则直接对 A/B/C 打分
-4. 如果启用 PMI：
-   - `adjusted = raw - pmi_alpha * null`
-5. 用 `softmax(adjusted / CALIBRATION_T)` 计算最终概率
-6. 应用规则过滤：
-   - 低 confidence -> 强制 HOLD
-   - 低 margin -> 强制 HOLD
-   - BUY 不够强 -> 强制 HOLD
-   - SELL 不够强 -> 强制 HOLD
-7. 组装 `TradingSignal`
+主要配置在 [config.py](/C:/Project/FinGPT/FinGPT_Part2/config.py)。
 
-## Batch 行为
+当前默认值里最值得关注的是：
 
-### Agent 1 batch
+- `CALIBRATION_T = 1.2`
+- `FINGPT_PMI_ALPHA = 1.0`
+- `FINGPT_SIGNAL_MIN_CONFIDENCE = 0.0`
+- `FINGPT_SIGNAL_MIN_MARGIN = 0.0`
+- `FINGPT_SIGNAL_USE_COT = False`
+- `FINGPT_BACKTEST_STRICT_MODE = False`
+- `FINGPT_BACKTEST_BATCH_SIZE = 10`
 
-`extract_fingerprint_batch(article_texts, tickers=None, headlines=None)` 会执行：
+这意味着当前默认回测更偏向：
 
-1. 一次 batched guided extraction 调用
-2. 一次 batched sentiment scoring 调用
-3. 一次 batched event-type scoring 调用
-4. Python 侧逐条组装 fingerprint
+- 使用 PMI 修正
+- 不启用 Agent 2 CoT
+- 先保留信号，再通过离线 grid search 调整 `alpha` 与 `confidence`
 
-现在即使某一条 extraction JSON 坏掉，逐条组装时也尽量不会立刻失败，因为 extraction 已经有 empty-payload fallback。
+## 6. Dashboard 说明
 
-### Agent 2 batch
+当前仓库已有静态 Dashboard 输出，目录在 [output/dashboard](/C:/Project/FinGPT/FinGPT_Part2/output/dashboard)。
 
-`generate_signal_batch(fingerprints)` 会执行：
+### 6.1 `pmi_alpha_grid_search_backtest.html`
 
-- no-CoT 模式：
-  - 一次 batched A/B/C scoring
-- CoT 模式：
-  - 一次 batched CoT generation
-  - 一次 batched A/B/C scoring
+文件：[pmi_alpha_grid_search_backtest.html](/C:/Project/FinGPT/FinGPT_Part2/output/dashboard/pmi_alpha_grid_search_backtest.html)
 
-### Backtest batch
+用途：
 
-一个 batch 的实际顺序是：
+- 展示 6 个 `pmi_alpha` 值的回测结果
+- 切换查看单个 alpha 的累计收益曲线
+- 查看 long / neutral / short 仓位构成
+- 查看总收益、每笔均值、命中率、Sharpe、Sortino、最大回撤
+- 底部柱图对比所有 alpha 的总收益与 Sharpe
 
-1. 跑 Agent 1 batch extraction
-2. 过滤出有效 fingerprints
-3. 跑 Agent 2 batch signal generation
-4. 逐行抓 realized return
-5. 拼装成最终 CSV
+当前 Dashboard 中展示的 alpha 为：
 
-## 失败与降级逻辑
+- `0.00`
+- `0.25`
+- `0.50`
+- `0.75`
+- `1.00`
+- `1.25`
 
-### Fact extraction 失败
+### 6.2 `alpha_confidence_2d_grid_search.html`
 
-当前行为：
+文件：[alpha_confidence_2d_grid_search.html](/C:/Project/FinGPT/FinGPT_Part2/output/dashboard/alpha_confidence_2d_grid_search.html)
 
-- extraction JSON 坏掉时，不会自动整条中断
-- 会退化为空 extraction payload
-- 只要 sentiment / event_type 正常，这条样本仍然可以继续进入 Agent 2
+用途：
 
-### Sentiment 失败
+- 对 `pmi_alpha` 与 `signal_min_confidence` 做二维网格搜索可视化
+- Heatmap 支持切换指标：
+  - `Total PnL`
+  - `Sharpe`
+  - `Direction accuracy`
+  - `Trade count`
+- 点击某个网格后，可查看：
+  - 总收益
+  - Sharpe
+  - 最大回撤
+  - 方向准确率
+  - trade 数
+  - forced-hold 比例
+  - long / neutral / short 数量
+- 下方折线图展示：同一 alpha 下，不同 confidence 阈值对应的 PnL
+- 下方柱图展示：不同 confidence 阈值下平均 trade 数与 forced-hold 率
 
-当前行为：
+### 6.3 `preview.html`
 
-- 降级成 `NEUTRAL`
-- 概率均匀
+文件：[preview.html](/C:/Project/FinGPT/FinGPT_Part2/output/dashboard/preview.html)
 
-### Event-type 失败
+这个页面是当前的 long-only grid search dashboard，用的是带 margin 过滤的买入信号。
 
-当前行为：
+策略逻辑可以概括为：
 
-- 赋值为 `OTHER`
-- `event_type_method = "event_type_logits_failed"`
+```python
+adjusted_logit = raw_logit - alpha * null_logit
+prob = softmax(adjusted_logit)
 
-### Agent 2 失败
+buy_margin = prob_buy - max(prob_hold, prob_sell)
 
-当前行为：
+if prob_buy >= confidence_threshold and buy_margin >= margin_threshold:
+    position = 1
+else:
+    position = 0
+```
 
-- 返回 `None`
-- 回测里标记成 `signal_failed`
+这里的含义是：
 
-## 配置项
+- 只做多，不做空
+- `BUY` 满足阈值时持有多头
+- `HOLD` 和 `SELL` 都视为现金 / 空仓
+- 相比普通 confidence 过滤，这个版本额外要求 `BUY` 对另外两类有足够 margin
 
-主配置在 [config.py](/C:/Project/FinGPT/FinGPT_Part2/config.py)。
+当前 `preview.html` 展示的内容包括：
 
-### 核心模型 / 推理
+- best gross 组合
+- best net 10bp 组合
+- Top 20 组合
+- 全部 grid
+- 每个组合的：
+  - `alpha`
+  - `confidence`
+  - `longs`
+  - `coverage`
+  - `long precision > 10bp`
+  - `gross`
+  - `net10bp`
+  - `net20bp`
+  - `Sharpe`
+  - `Sortino`
+  - `MaxDD`
 
-- `FINGPT_MODEL_PATH`
-- `SHARE_SINGLE_LLM_BETWEEN_AGENTS`
-- `CALIBRATION_T`
-- `LOGITS_MAX_TOKENS`
+## 7. 关于模型当前的表现
 
-### 新闻抓取
+以下结论来自当前产物：
 
-- `NEWS_PROVIDER`
-- `ALPACA_API_KEY`
-- `ALPACA_API_SECRET`
-- `ALPACA_DEFAULT_LIMIT`
-- `FINGPT_NEWS_FETCH_COUNT`
-- `FINNHUB_API_KEY`
-- `FINNHUB_TIMEOUT_SEC`
-- `FINNHUB_MAX_CALLS_PER_SEC`
-- `FINNHUB_MAX_RETRIES`
-- `FINNHUB_RETRY_BASE_DELAY_SEC`
+- [output/pmi_alpha_grid_search.csv](/C:/Project/FinGPT/FinGPT_Part2/output/pmi_alpha_grid_search.csv)
+- [output/alpha_confidence_grid_search.csv](/C:/Project/FinGPT/FinGPT_Part2/output/alpha_confidence_grid_search.csv)
+- 两个 HTML dashboard
 
-### Agent 1 event_type 过滤
+### 7.1 基础回测覆盖情况
 
-- `FINGPT_EVENT_TYPE_MIN_CONFIDENCE`
-- `FINGPT_EVENT_TYPE_MIN_MARGIN`
+- 总样本 `300`
+- 成功定价并进入有效统计的样本 `290`
+- `10` 条为 `price_fetch_failed`
+- 当前 artifact 对应的基础 run 默认 `pmi_alpha=1.0`、`signal_min_confidence=0.0`
 
-### Agent 2 PMI / 信号过滤
+### 7.2 `pmi_alpha` 单维扫描结论
 
-- `FINGPT_PMI_ALPHA`
-- `FINGPT_SIGNAL_MIN_CONFIDENCE`
-- `FINGPT_SIGNAL_MIN_MARGIN`
-- `FINGPT_BUY_THRESHOLD`
-- `FINGPT_SELL_THRESHOLD`
-- `FINGPT_SIGNAL_USE_COT`
+在当前这批结果里，`pmi_alpha` 对收益影响非常大，而且默认 `1.0` 不是最优点。
 
-### 回测
+表现最好的几个点：
 
-- `FINGPT_BACKTEST_STRICT_MODE`
-- `FINGPT_BACKTEST_BATCH_SIZE`
+- `alpha=0.0`：`total_pnl=0.2814`，`annualized_sharpe=0.2870`，`direction_accuracy=44.14%`
+- `alpha=0.5`：`total_pnl=0.1373`
+- `alpha=0.25`：`total_pnl=0.1326`
 
-## 回测输出
+表现较差的几个点：
 
-主要输出是一个详细 CSV，每一行对应一条数据集样本。
+- `alpha=0.75`：`total_pnl=-0.3657`
+- `alpha=1.0`：`total_pnl=-0.2632`
+- `alpha=1.25`：`total_pnl=-0.3162`
 
-关键暴露字段包括：
+从当前结果看，较强 PMI 修正会明显把仓位推向 `short`：
 
-### 原始 / 元数据
+- `alpha=1.0` 时，成功样本里 `short=249`，`long=12`
+- `alpha=1.25` 时，成功样本里 `short=270`，`long=7`
 
-- `ticker`
-- `headline`
-- `fingerprint_ticker`
-- `signal_ticker`
-- `start_date`
-- `end_date`
-- `fingpt_label`
+这说明当前模型与当前数据上，PMI 默认值偏强，存在把信号整体拉向卖出侧的风险。
 
-### Agent 1
+### 7.3 `alpha + confidence` 二维扫描结论
 
-- `sentiment_*`
-- `event_type_*`
-- `event_logprob_*`
-- `event_prob_*`
+二维 grid search 的最好组合是：
 
-### Agent 2
+- `pmi_alpha=0.0`
+- `signal_min_confidence=0.35`
 
-- `direction`
-- `confidence`
-- `raw_signal_logprob_*`
-- `pmi_null_logprob_*`
-- `pmi_adjusted_logit_*`
-- `signal_prob_*`
-- `signal_filter_*`
+对应结果：
 
-### 评估
+- `total_pnl=0.3028`
+- `annualized_sharpe=0.3101`
+- `direction_accuracy=43.79%`
+- `num_trades=232`
+- `forced_hold_rate≈1.33%`
 
-- `realized_return`
-- `strategy_return`
-- `skipped_reason`
+这比 `alpha=0.0, confidence=0.30` 略好，也明显优于当前默认 `alpha=1.0, confidence=0.0`。
 
-## 想改哪里就看哪里
+整体趋势上：
 
-### 想改抽取逻辑
+- 轻微提高 `confidence` 阈值有时能改善收益和 Sharpe
+- 但阈值过高会快速提升 `forced_hold_rate`
+- 当 `confidence >= 0.45` 后，多数组合的 trade 数明显下降
+- 当 `confidence >= 0.50` 后，很多组合已经进入“高 abstention、低覆盖”的状态
+
+### 7.4 当前 long-only 表现简述
+
+long-only 结果来自 [preview.html](/C:/Project/FinGPT/FinGPT_Part2/output/dashboard/preview.html)。
+
+当前这个 long-only dashboard 的最好 gross 组合是：
+
+- `alpha=0.05`
+- `confidence=0.30`
+
+对应结果：
+
+- `gross=0.4306`
+- `Sharpe=0.495`
+- `MaxDD=0.3798`
+- `longs=165`
+- `coverage=56.9%`
+- `long precision > 10bp = 58.8%`
+
+同一个组合也是当前页面中的 best net 10bp：
+
+- `net10bp=0.2656`
+- `net20bp=0.1006`
+
+从当前 long-only grid 看，几个比较清楚的现象是：
+
+- 小幅 `alpha`，尤其 `0.00` 到 `0.25` 左右，表现整体更稳
+- `confidence=0.30` 到 `0.35` 是当前较好的区间
+- 阈值继续提高到 `0.45+` 后，coverage 会快速下降
+- 高阈值下虽然个别 trade 质量可能更高，但样本数会明显变少，整体收益未必更优，且泛化能力值得怀疑
+
+## 8. 想改哪里看哪里
+
+### 改 Agent 1
 
 - [agent1/prompt.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/prompt.py)
 - [agent1/extractor.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/extractor.py)
 - [agent1/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent1/schema.py)
 
-### 想改策略信号逻辑
+### 改 Agent 2
 
 - [agent2/prompt.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/prompt.py)
 - [agent2/reasoner.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/reasoner.py)
 - [agent2/schema.py](/C:/Project/FinGPT/FinGPT_Part2/agent2/schema.py)
 
-### 想改回测
+### 改回测与离线搜索
 
-- [backtest/dataset_parser.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/dataset_parser.py)
 - [backtest/backtester.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/backtester.py)
+- [backtest/pmi_grid_search.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/pmi_grid_search.py)
+- [backtest/dataset_parser.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/dataset_parser.py)
 - [backtest/price_fetcher.py](/C:/Project/FinGPT/FinGPT_Part2/backtest/price_fetcher.py)
 
-### 想改实时抓取 / leakage-safe 逻辑
+### 改实时抓取
 
 - [ingestion/news_fetcher.py](/C:/Project/FinGPT/FinGPT_Part2/ingestion/news_fetcher.py)
 - [pipeline.py](/C:/Project/FinGPT/FinGPT_Part2/pipeline.py)

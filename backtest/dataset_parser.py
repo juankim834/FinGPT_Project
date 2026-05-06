@@ -60,6 +60,7 @@ def load_dataset(path: str) -> pd.DataFrame:
     df = df.rename(columns=column_aliases)
 
     required = ["input", "output", "answer", "ticker"]
+    optional = ["skip_llm", "forced_signal", "skip_reason", "pass_reason"]
     normalized = pd.DataFrame(index=df.index)
     for col in required:
         if col not in df.columns:
@@ -68,6 +69,15 @@ def load_dataset(path: str) -> pd.DataFrame:
 
         selected = df[col]
         # Handle duplicate column labels that return a DataFrame.
+        if isinstance(selected, pd.DataFrame):
+            selected = selected.iloc[:, 0]
+        normalized[col] = selected
+
+    for col in optional:
+        if col not in df.columns:
+            normalized[col] = ""
+            continue
+        selected = df[col]
         if isinstance(selected, pd.DataFrame):
             selected = selected.iloc[:, 0]
         normalized[col] = selected
@@ -168,10 +178,40 @@ def build_backtest_rows(df: pd.DataFrame) -> list[dict]:
             return ""
         return str(raw)
 
+    def _row_bool(row_obj: pd.Series, key: str) -> bool:
+        raw = row_obj.get(key, False)
+        if isinstance(raw, pd.Series):
+            raw = raw.iloc[0] if len(raw) else False
+        if pd.isna(raw):
+            return False
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
     rows: list[dict] = []
     for _, row in df.iterrows():
         raw_input = _row_value(row, "input")
         ticker = _row_value(row, "ticker").strip().upper()
+        skip_llm = _row_bool(row, "skip_llm")
+        forced_signal = _row_value(row, "forced_signal").strip()
+        skip_reason = _row_value(row, "skip_reason").strip()
+        pass_reason = _row_value(row, "pass_reason").strip()
+
+        if skip_llm:
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "headline": "",
+                    "start_date": "",
+                    "end_date": "",
+                    "article_text": "",
+                    "fingpt_label": "neutral",
+                    "skip_llm": True,
+                    "forced_signal": forced_signal,
+                    "skip_reason": skip_reason,
+                    "pass_reason": pass_reason,
+                }
+            )
+            continue
+
         article_text = extract_article_text(raw_input)
         if not ticker or not article_text:
             continue
@@ -187,6 +227,10 @@ def build_backtest_rows(df: pd.DataFrame) -> list[dict]:
                 "end_date": end_date,
                 "article_text": article_text,
                 "fingpt_label": fingpt_label,
+                "skip_llm": False,
+                "forced_signal": forced_signal,
+                "skip_reason": skip_reason,
+                "pass_reason": pass_reason,
             }
         )
     return rows

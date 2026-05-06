@@ -5,7 +5,10 @@ import pandas as pd
 from backtest.pmi_grid_search import (
     apply_pmi_alpha_to_results,
     parse_alpha_grid,
+    parse_confidence_grid,
+    run_alpha_confidence_grid_search,
     run_pmi_alpha_grid_search,
+    run_signal_confidence_grid_search,
 )
 
 
@@ -80,3 +83,38 @@ def test_run_pmi_alpha_grid_search_returns_summary_metrics():
 
 def test_parse_alpha_grid_handles_comma_separated_list():
     assert parse_alpha_grid("0, 0.25,1.0") == [0.0, 0.25, 1.0]
+
+
+def test_run_signal_confidence_grid_search_forces_more_neutral_rows():
+    summary = run_signal_confidence_grid_search(
+        _base_results(),
+        confidence_levels=[0.0, 0.8],
+        pmi_alpha=0.0,
+        calibration_t=1.0,
+    )
+
+    low = summary.loc[summary["signal_min_confidence"] == 0.0].iloc[0]
+    high = summary.loc[summary["signal_min_confidence"] == 0.8].iloc[0]
+
+    assert high["signal_neutral_count"] >= low["signal_neutral_count"]
+    assert high["forced_hold_count"] >= low["forced_hold_count"]
+    assert high["coverage"] <= low["coverage"]
+
+
+def test_parse_confidence_grid_handles_comma_separated_list():
+    assert parse_confidence_grid("0.3, 0.35,0.4") == [0.3, 0.35, 0.4]
+
+
+def test_run_alpha_confidence_grid_search_returns_all_combinations():
+    summary = run_alpha_confidence_grid_search(
+        _base_results(),
+        alphas=[0.0, 1.0],
+        confidence_levels=[0.0, 0.8],
+        calibration_t=1.0,
+    )
+
+    assert len(summary) == 4
+    assert set(summary["pmi_alpha"]) == {0.0, 1.0}
+    assert set(summary["signal_min_confidence"]) == {0.0, 0.8}
+    assert "forced_hold_count" in summary.columns
+    assert "rank_total_pnl" in summary.columns
