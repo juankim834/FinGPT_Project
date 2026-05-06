@@ -37,6 +37,7 @@ def _make_base_result(row: dict) -> dict:
     nan = math.nan
     return {
         "ticker": row["ticker"],
+        "headline": row.get("headline", ""),
         "fingerprint_ticker": None,
         "signal_ticker": None,
         "start_date": row["start_date"],
@@ -264,6 +265,7 @@ def run_backtest(
             fingerprints = extract_fingerprint_batch(
                 [r["article_text"] for r in batch],
                 tickers=batch_tickers,
+                headlines=[r.get("headline", "") for r in batch],
             )
         except Exception as exc:
             logger.exception(

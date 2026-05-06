@@ -3,7 +3,7 @@ agent1/extractor.py — Agent 1: FinGPT fact extractor + logits-based sentiment 
 
 Pipeline per article
 --------------------
-1. Fact extraction  — guided-decoding vLLM call → JSON (source, headline, …).
+1. Fact extraction  — guided-decoding vLLM call → JSON (source, companies, …).
 2. Sentiment scoring — direct vLLM scoring → real token logprobs for
                        [POSITIVE, NEGATIVE, NEUTRAL].
 3. Event type scoring — direct scoring vLLM call → real token logprobs for
@@ -335,11 +335,10 @@ def _build_guided_extraction_schema() -> dict[str, Any]:
         "properties": {
             "source": {"type": "string"},
             "published_at": {"type": "string"},
-            "headline": {"type": "string"},
             "companies_named": {"type": "array", "items": {"type": "string"}},
             "event_keywords": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["source", "published_at", "headline", "companies_named", "event_keywords"],
+        "required": ["source", "published_at", "companies_named", "event_keywords"],
     }
     return schema
 
@@ -677,6 +676,7 @@ def _assemble_fingerprint(
     event_type: dict[str, Any],
     article_text: str,
     fallback_ticker: Optional[str] = None,
+    fallback_headline: Optional[str] = None,
 ) -> NewsFingerprint:
     """
     Build a ``NewsFingerprint`` from fact-extraction, sentiment, and event_type dicts.
@@ -699,7 +699,7 @@ def _assemble_fingerprint(
         "ticker": fallback_ticker or "",
         "source": extracted.get("source", ""),
         "published_at": extracted.get("published_at", ""),
-        "headline": extracted.get("headline", ""),
+        "headline": fallback_headline or extracted.get("headline", ""),
         "companies_named": companies_named,
         # Backward compat: set to [event_type] so downstream code that reads
         # event_keywords still gets a meaningful single-item list.
@@ -735,6 +735,7 @@ def _build_extraction_prompt(article_text: str) -> str:
 def extract_fingerprint_batch(
     article_texts: list[str],
     tickers: Optional[list[str]] = None,
+    headlines: Optional[list[str]] = None,
 ) -> list[Optional[NewsFingerprint]]:
     """
     Batch version of ``extract_fingerprint``.
@@ -755,6 +756,10 @@ def extract_fingerprint_batch(
     tickers:
         Optional list of tickers (same length as article_texts) used as
         fallback when companies_named is empty (dataset ticker fallback).
+    headlines:
+        Optional list of raw headlines (same length as article_texts). When
+        provided, the fingerprint keeps this external headline instead of a
+        model-generated one.
 
     Returns a list of the same length as *article_texts*.  Items are ``None``
     wherever extraction or validation fails.
@@ -778,6 +783,12 @@ def extract_fingerprint_batch(
             len(tickers), n,
         )
         tickers = None
+    if headlines is not None and len(headlines) != n:
+        logger.warning(
+            "headlines length (%d) != article_texts length (%d); ignoring headlines.",
+            len(headlines), n,
+        )
+        headlines = None
 
     from vllm import SamplingParams  # type: ignore
 
@@ -832,6 +843,7 @@ def extract_fingerprint_batch(
     fingerprints: list[Optional[NewsFingerprint]] = []
     for i, article_text in enumerate(article_texts):
         fallback_ticker = tickers[i] if tickers else None
+        fallback_headline = headlines[i] if headlines else None
         try:
             clean_extraction = _normalize_generated_text(raw_extractions[i])
             _save_md_debug_output(article_text, clean_extraction, "extraction", 1, 2048)
@@ -849,7 +861,14 @@ def extract_fingerprint_batch(
             )
 
             fingerprints.append(
-                _assemble_fingerprint(extracted, sentiment, event_type, article_text, fallback_ticker)
+                _assemble_fingerprint(
+                    extracted,
+                    sentiment,
+                    event_type,
+                    article_text,
+                    fallback_ticker,
+                    fallback_headline,
+                )
             )
         except Exception as exc:
             logger.error(
@@ -863,6 +882,7 @@ def extract_fingerprint_batch(
 def extract_fingerprint(
     article_text: str,
     ticker: Optional[str] = None,
+    headline: Optional[str] = None,
 ) -> Optional[NewsFingerprint]:
     """
     Extract structured facts, logits-based sentiment, and logits-based event_type
@@ -875,6 +895,9 @@ def extract_fingerprint(
     ticker:
         Optional ticker used as companies_named fallback when the model
         fails to extract any company name.
+    headline:
+        Optional raw headline preserved in the fingerprint. When omitted,
+        Agent 1 may fall back to the extracted headline field.
 
     Returns None on any model, parse, or validation failure.
     """
@@ -905,7 +928,14 @@ def extract_fingerprint(
         # Logits-based event_type scoring.
         event_type = _score_event_type(article_text)
 
-        return _assemble_fingerprint(extracted, sentiment, event_type, article_text, ticker)
+        return _assemble_fingerprint(
+            extracted,
+            sentiment,
+            event_type,
+            article_text,
+            ticker,
+            headline,
+        )
 
     except Exception as exc:
         logger.error("extract_fingerprint failed: %s", exc, exc_info=True)

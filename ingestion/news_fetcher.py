@@ -9,7 +9,7 @@ to Agent 1.
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 import requests
 
@@ -30,6 +30,73 @@ from config import (
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+
+def _coerce_timestamp(value: Any) -> Optional[datetime]:
+    """Parse timestamps from API payloads / caller inputs into UTC datetimes."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _filter_articles_at_or_before(
+    articles: list[dict[str, Any]],
+    as_of_timestamp: datetime,
+) -> list[dict[str, Any]]:
+    """
+    Keep only timestamped articles that were published at or before *as_of_timestamp*.
+
+    Articles with missing / unparseable timestamps are dropped to keep the
+    selection leakage-safe.
+    """
+    filtered: list[dict[str, Any]] = []
+    for article in articles:
+        created_at = _coerce_timestamp(article.get("created_at"))
+        if created_at is None:
+            continue
+        if created_at <= as_of_timestamp:
+            filtered.append(article)
+    return filtered
+
+
+def _select_latest_article_per_ticker(
+    articles: list[dict[str, Any]],
+    tickers: list[str],
+) -> list[dict[str, Any]]:
+    """
+    For each requested ticker, keep the latest available article.
+
+    Input articles are expected to have already been leakage-safe filtered.
+    """
+    selected: list[dict[str, Any]] = []
+    for ticker in tickers:
+        matching = [
+            article for article in articles
+            if str(article.get("source_ticker", "")).strip().upper() == ticker.strip().upper()
+        ]
+        matching.sort(
+            key=lambda article: _coerce_timestamp(article.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        if matching:
+            selected.append(matching[0])
+    return selected
 
 
 def _rate_limit_sleep(last_call_ts: float | None) -> float:
@@ -209,6 +276,8 @@ def _fetch_recent_articles_finnhub(
 def fetch_recent_articles(
     tickers: list[str],
     limit: int = ALPACA_DEFAULT_LIMIT,
+    as_of_timestamp: Any = None,
+    nearest_per_ticker: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Returns a list of article dicts with keys:
@@ -216,15 +285,35 @@ def fetch_recent_articles(
 
     Concatenate headline + summary as the article_text passed to Agent 1.
 
+    If ``as_of_timestamp`` is provided, only timestamped articles at or before
+    that instant are kept. When ``nearest_per_ticker`` is True, the result
+    contains at most one article per requested ticker: the latest one prior to
+    ``as_of_timestamp``.
+
     Raises:
         requests.HTTPError: if the selected API returns a non-2xx status.
         ValueError: if API credentials are missing.
     """
     provider = NEWS_PROVIDER or "alpaca"
     if provider == "finnhub":
-        return _fetch_recent_articles_finnhub(tickers=tickers, limit=limit)
-    if provider == "alpaca":
-        return _fetch_recent_articles_alpaca(tickers=tickers, limit=limit)
-    raise ValueError(
+        articles = _fetch_recent_articles_finnhub(tickers=tickers, limit=limit)
+    elif provider == "alpaca":
+        articles = _fetch_recent_articles_alpaca(tickers=tickers, limit=limit)
+    else:
+        raise ValueError(
         f"Unsupported NEWS_PROVIDER={provider!r}. Use 'alpaca' or 'finnhub'."
-    )
+        )
+
+    if as_of_timestamp is not None:
+        as_of_dt = _coerce_timestamp(as_of_timestamp)
+        if as_of_dt is None:
+            raise ValueError(f"Invalid as_of_timestamp: {as_of_timestamp!r}")
+        articles = _filter_articles_at_or_before(articles, as_of_dt)
+        articles.sort(
+            key=lambda article: _coerce_timestamp(article.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        if nearest_per_ticker:
+            articles = _select_latest_article_per_ticker(articles, tickers)
+
+    return articles

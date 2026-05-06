@@ -115,6 +115,22 @@ def extract_article_text(input_prompt: str) -> str:
     return news_block
 
 
+def extract_primary_headline(input_prompt: str) -> str:
+    """
+    Extract the first headline from a raw [INST] prompt.
+
+    For multi-news prompts without per-item timestamps, the first headline is
+    treated as the primary / most relevant headline for downstream use.
+    """
+    text = input_prompt or ""
+    text = _INST_TAG_RE.sub(" ", text).strip()
+
+    match = re.search(r"\[Headline\]:\s*(.*?)(?=\s*\[Summary\]:|\s*\[Headline\]:|\Z)", text, re.IGNORECASE | re.DOTALL)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip()
+    return ""
+
+
 def extract_date_range(input_prompt: str) -> tuple[str, str]:
     """
     Parse `From YYYY-MM-DD to YYYY-MM-DD` from prompt text.
@@ -166,6 +182,7 @@ def build_backtest_rows(df: pd.DataFrame) -> list[dict]:
         rows.append(
             {
                 "ticker": ticker,
+                "headline": extract_primary_headline(raw_input),
                 "start_date": start_date,
                 "end_date": end_date,
                 "article_text": article_text,

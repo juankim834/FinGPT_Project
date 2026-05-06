@@ -44,6 +44,7 @@ ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "")
 ALPACA_API_SECRET: str = os.getenv("ALPACA_API_SECRET", "")
 ALPACA_NEWS_URL: str = "https://data.alpaca.markets/v1beta1/news"
 ALPACA_DEFAULT_LIMIT: int = 50
+FINGPT_NEWS_FETCH_COUNT: int = int(os.getenv("FINGPT_NEWS_FETCH_COUNT", str(ALPACA_DEFAULT_LIMIT)))
 
 FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
 FINNHUB_NEWS_URL: str = "https://finnhub.io/api/v1/company-news"

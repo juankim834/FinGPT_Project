@@ -10,7 +10,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from config import LOG_LEVEL, OUTPUT_DIR
+from config import FINGPT_NEWS_FETCH_COUNT, LOG_LEVEL, OUTPUT_DIR
 from ingestion.news_fetcher import fetch_recent_articles
 from agent1.extractor import extract_fingerprint
 from agent2.reasoner import generate_signal
@@ -22,15 +22,23 @@ logger = logging.getLogger(__name__)
 
 def run_pipeline(
     tickers: list[str],
-    limit: int = 20,
+    limit: int = FINGPT_NEWS_FETCH_COUNT,
+    as_of_timestamp: datetime | str | None = None,
 ) -> list[TradingSignal]:
     """
     Fetch news, run Agent 1 (fact extraction) then Agent 2 (signal reasoning)
-    for each article. Returns the list of valid TradingSignals produced.
+    for the latest leakage-safe article per ticker. Returns the list of valid
+    TradingSignals produced.
 
     The full list is also written to output/signals_<timestamp>.json.
     """
-    articles = fetch_recent_articles(tickers, limit)
+    selection_ts = as_of_timestamp or datetime.now(timezone.utc)
+    articles = fetch_recent_articles(
+        tickers,
+        limit=limit,
+        as_of_timestamp=selection_ts,
+        nearest_per_ticker=True,
+    )
     logger.info("Pipeline received %d articles to process.", len(articles))
 
     signals: list[TradingSignal] = []
@@ -42,6 +50,7 @@ def run_pipeline(
         fingerprint = extract_fingerprint(
             article_text,
             ticker=str(article.get("source_ticker", "") or ""),
+            headline=str(article.get("headline", "") or ""),
         )
         if fingerprint is None:
             logger.info("[%d/%d] Fingerprint extraction failed — skipping.", i, len(articles))

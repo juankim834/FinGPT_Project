@@ -65,6 +65,7 @@ def collect_held_out_batch(
         fingerprint = extract_fingerprint(
             article_text,
             ticker=str(article.get("source_ticker", "") or ""),
+            headline=headline,
         )
         if fingerprint is None:
             skipped_agent1 += 1
