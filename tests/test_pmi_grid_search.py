@@ -5,6 +5,8 @@ import pandas as pd
 from backtest.pmi_grid_search import (
     apply_long_only_grid_strategy,
     apply_pmi_alpha_to_results,
+    run_no_pmi_confidence_margin_grid_search,
+    run_no_pmi_long_only_grid_search,
     parse_alpha_grid,
     parse_confidence_grid,
     run_alpha_confidence_margin_grid_search,
@@ -162,3 +164,23 @@ def test_run_long_only_grid_search_returns_cartesian_product():
     assert len(summary) == 8
     assert set(summary["strategy_mode"]) == {"long_only"}
     assert set(summary["signal_short_count"]) == {0}
+
+
+def test_no_pmi_grid_search_wrappers_fix_alpha_to_zero():
+    mixed = run_no_pmi_confidence_margin_grid_search(
+        _base_results(),
+        confidence_levels=[0.0, 0.8],
+        margin_levels=[0.0, 0.2],
+        calibration_t=1.0,
+    )
+    long_only = run_no_pmi_long_only_grid_search(
+        _base_results(),
+        confidence_levels=[0.0, 0.8],
+        margin_levels=[0.0, 0.2],
+        calibration_t=1.0,
+    )
+
+    assert set(mixed["pmi_alpha"]) == {0.0}
+    assert set(long_only["pmi_alpha"]) == {0.0}
+    assert set(mixed["strategy_mode"]) == {"no_pmi_mixed"}
+    assert set(long_only["strategy_mode"]) == {"no_pmi_long_only"}

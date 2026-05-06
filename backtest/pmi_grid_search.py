@@ -900,6 +900,64 @@ def run_long_only_grid_search(
     return summary
 
 
+def run_no_pmi_confidence_margin_grid_search(
+    results_or_path: pd.DataFrame | str,
+    *,
+    confidence_levels: list[float],
+    margin_levels: list[float],
+    output_path: Optional[str] = None,
+    detailed_output_dir: Optional[str] = None,
+    calibration_t: float = CALIBRATION_T,
+    buy_threshold: float = FINGPT_BUY_THRESHOLD,
+    sell_threshold: float = FINGPT_SELL_THRESHOLD,
+) -> pd.DataFrame:
+    """
+    Convenience wrapper for the mixed strategy with no PMI correction.
+    Equivalent to pmi_alpha = 0.0, but saved/reported explicitly.
+    """
+    summary = run_alpha_confidence_margin_grid_search(
+        results_or_path,
+        alphas=[0.0],
+        confidence_levels=confidence_levels,
+        margin_levels=margin_levels,
+        output_path=output_path,
+        detailed_output_dir=detailed_output_dir,
+        calibration_t=calibration_t,
+        buy_threshold=buy_threshold,
+        sell_threshold=sell_threshold,
+    ).copy()
+    if not summary.empty:
+        summary["strategy_mode"] = "no_pmi_mixed"
+    return summary
+
+
+def run_no_pmi_long_only_grid_search(
+    results_or_path: pd.DataFrame | str,
+    *,
+    confidence_levels: list[float],
+    margin_levels: list[float],
+    output_path: Optional[str] = None,
+    detailed_output_dir: Optional[str] = None,
+    calibration_t: float = CALIBRATION_T,
+) -> pd.DataFrame:
+    """
+    Convenience wrapper for the long-only strategy with no PMI correction.
+    Equivalent to pmi_alpha = 0.0, but saved/reported explicitly.
+    """
+    summary = run_long_only_grid_search(
+        results_or_path,
+        alphas=[0.0],
+        confidence_levels=confidence_levels,
+        margin_levels=margin_levels,
+        output_path=output_path,
+        detailed_output_dir=detailed_output_dir,
+        calibration_t=calibration_t,
+    ).copy()
+    if not summary.empty:
+        summary["strategy_mode"] = "no_pmi_long_only"
+    return summary
+
+
 def parse_alpha_grid(alpha_spec: str) -> list[float]:
     """
     Parse a comma-separated alpha list like ``"0,0.25,0.5,1.0"``.
