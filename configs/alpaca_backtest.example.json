@@ -1,7 +1,7 @@
 {
   "symbols": ["GLD", "SLV", "IAU", "AMZN", "AAPL", "COP", "XLU"],
-  "start": "2025-12-25",
-  "end": "2026-04-30",
+  "start": "2025-12-29",
+  "end": "2026-04-24",
   "frequency": "weekly",
   "fetch_articles_per_symbol": 50,
   "combine_articles_per_sample": 5,
