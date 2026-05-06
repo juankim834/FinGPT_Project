@@ -87,3 +87,92 @@ LOG_LEVEL: str = "INFO"
 # immediately, skipping the extra vLLM call entirely.
 # Set to "" to disable persistence (always recompute).
 PMI_PRIOR_PATH: str = os.getenv("FINGPT_PMI_PRIOR_PATH", "output/pmi_null_logprobs.json")
+
+# ---------------------------------------------------------------------------
+# Agent 1 — event_type logits classifier
+# ---------------------------------------------------------------------------
+
+# Score tokens sent to vLLM for event_type classification (A-G, no OTHER).
+# OTHER is assigned by Python post-processing when confidence/margin is too low.
+EVENT_TYPE_CLASSES: list[str] = ["A", "B", "C", "D", "E", "F", "G"]
+
+# Mapping from score token to concrete event type label.
+EVENT_TYPE_MAP: dict[str, str] = {
+    "A": "EARNINGS",
+    "B": "GUIDANCE",
+    "C": "ANALYST_RATING",
+    "D": "LEGAL_REGULATORY",
+    "E": "MNA",
+    "F": "PRODUCT_BUSINESS",
+    "G": "MACRO",
+}
+
+# Minimum softmax probability for the top event_type class; below this the
+# event_type is set to OTHER with method="abstained_low_confidence".
+# Default 0.0 = no filtering (all concrete labels accepted).
+FINGPT_EVENT_TYPE_MIN_CONFIDENCE: float = float(
+    os.getenv("FINGPT_EVENT_TYPE_MIN_CONFIDENCE", "0.0")
+)
+
+# Minimum margin (top_prob − second_prob) required to accept a concrete label.
+# Below this margin the event_type is set to OTHER with method="abstained_low_margin".
+# Default 0.0 = no filtering.
+FINGPT_EVENT_TYPE_MIN_MARGIN: float = float(
+    os.getenv("FINGPT_EVENT_TYPE_MIN_MARGIN", "0.0")
+)
+
+# ---------------------------------------------------------------------------
+# Agent 2 — PMI alpha
+# ---------------------------------------------------------------------------
+
+# Scaling factor for the PMI null-context correction:
+#   adjusted_logit[t] = raw_logit[t] - pmi_alpha * null_logprob[t]
+# alpha=1.0 → full PMI correction (original behaviour).
+# alpha=0.0 → no PMI correction (raw logits only).
+FINGPT_PMI_ALPHA: float = float(os.getenv("FINGPT_PMI_ALPHA", "1.0"))
+
+# ---------------------------------------------------------------------------
+# Agent 2 — signal confidence / margin / direction filters
+# ---------------------------------------------------------------------------
+
+# If the top-class softmax probability is below this value, force HOLD.
+FINGPT_SIGNAL_MIN_CONFIDENCE: float = float(
+    os.getenv("FINGPT_SIGNAL_MIN_CONFIDENCE", "0.0")
+)
+
+# If the top1−top2 margin is below this value, force HOLD.
+FINGPT_SIGNAL_MIN_MARGIN: float = float(
+    os.getenv("FINGPT_SIGNAL_MIN_MARGIN", "0.0")
+)
+
+# Minimum probability required to emit a BUY signal (when top label is A).
+# If prob[A] < threshold, force HOLD.
+FINGPT_BUY_THRESHOLD: float = float(os.getenv("FINGPT_BUY_THRESHOLD", "0.0"))
+
+# Minimum probability required to emit a SELL signal (when top label is C).
+# If prob[C] < threshold, force HOLD.
+FINGPT_SELL_THRESHOLD: float = float(os.getenv("FINGPT_SELL_THRESHOLD", "0.0"))
+
+# ---------------------------------------------------------------------------
+# Agent 2 — chain-of-thought mode
+# ---------------------------------------------------------------------------
+
+# When True, Agent 2 performs a full CoT generation pass before scoring A/B/C.
+# When False (default for backtesting), directly score A/B/C after the compact
+# prompt — faster and equally accurate for signal extraction.
+FINGPT_SIGNAL_USE_COT: bool = _env_bool("FINGPT_SIGNAL_USE_COT", False)
+
+# ---------------------------------------------------------------------------
+# Backtest — strict mode and batch size
+# ---------------------------------------------------------------------------
+
+# When True, rows are skipped (not gracefully degraded) on any logits failure:
+#   - fingerprint_failed → skipped
+#   - event_type_logits_failed → skipped
+#   - signal_logits_failed → skipped
+# When False (default), graceful fallbacks are applied where available.
+FINGPT_BACKTEST_STRICT_MODE: bool = _env_bool("FINGPT_BACKTEST_STRICT_MODE", False)
+
+# Number of articles processed in a single batched vLLM call.
+# Overridable via CLI --batch-size.
+FINGPT_BACKTEST_BATCH_SIZE: int = int(os.getenv("FINGPT_BACKTEST_BATCH_SIZE", "10"))

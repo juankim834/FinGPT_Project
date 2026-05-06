@@ -1,10 +1,16 @@
 """
 agent1/schema.py — Pydantic schema for Agent 1 output.
 
-Sentiment is now expressed as a 3-class label (POSITIVE / NEGATIVE / NEUTRAL)
+Sentiment is expressed as a 3-class label (POSITIVE / NEGATIVE / NEUTRAL)
 derived deterministically from LLM-reported logits via softmax post-processing.
-The NewsFingerprint also carries the full probability vector and calibration
-temperature so downstream consumers can reproduce the probability calculation.
+
+Event type is expressed as one of 7 concrete categories (EARNINGS, GUIDANCE,
+ANALYST_RATING, LEGAL_REGULATORY, MNA, PRODUCT_BUSINESS, MACRO) or OTHER
+when confidence/margin thresholds are not met.  It is derived from A-G token
+logprobs — OTHER is never a candidate score token (it is assigned by Python).
+
+The NewsFingerprint carries the full probability vectors and calibration
+temperature so downstream consumers can reproduce probability calculations.
 """
 
 from typing import Literal, Optional
@@ -26,16 +32,19 @@ _SENTIMENT_SCORE: dict[str, float] = {
 
 class NewsFingerprint(BaseModel):
     # -----------------------------------------------------------------------
-    # Fact-extraction fields (unchanged from previous version)
+    # Fact-extraction fields
     # -----------------------------------------------------------------------
     source: str
     published_at: str
     headline: str
     companies_named: list[str]
-    event_keywords: list[str]
+
+    # event_keywords kept for backward compatibility; defaults to empty list.
+    # In the new pipeline this is set to [event_type] by _assemble_fingerprint.
+    event_keywords: list[str] = Field(default_factory=list)
 
     # -----------------------------------------------------------------------
-    # Sentiment fields — now populated from logits post-processing
+    # Sentiment fields — populated from logits post-processing
     # -----------------------------------------------------------------------
     sentiment_label: SentimentLabel
 
@@ -56,16 +65,47 @@ class NewsFingerprint(BaseModel):
     # Raw logits reported by the LLM (before softmax), stored for auditing.
     sentiment_logits: Optional[list[float]] = None
 
-    # Original article text — stored so Agent 2 can include it in its prompt
-    # without requiring a separate argument to generate_signal().
+    # -----------------------------------------------------------------------
+    # Event type fields — populated from A-G logits post-processing
+    # -----------------------------------------------------------------------
+
+    # Concrete event category or "OTHER" when thresholds are not met.
+    event_type: str = "OTHER"
+
+    # Softmax probability of the top event_type class (None if logits failed).
+    event_type_confidence: Optional[float] = None
+
+    # top_prob − second_prob margin (None if logits failed).
+    event_type_margin: Optional[float] = None
+
+    # How event_type was assigned:
+    #   "logits_accepted"           — concrete label accepted
+    #   "abstained_low_confidence"  — top_prob < min_confidence → OTHER
+    #   "abstained_low_margin"      — margin < min_margin → OTHER
+    #   "event_type_logits_failed"  — vLLM call failed → OTHER
+    event_type_method: Optional[str] = None
+
+    # Raw log-probabilities for each A-G token, keyed by token letter.
+    event_type_logits: Optional[dict[str, float]] = None
+
+    # Softmax probability for each A-G token after calibration.
+    event_type_probabilities: Optional[dict[str, float]] = None
+
+    # Second-best concrete event category (None if logits failed).
+    secondary_event_type: Optional[str] = None
+
+    # Softmax probability of the second-best event_type class.
+    secondary_event_type_confidence: Optional[float] = None
+
+    # -----------------------------------------------------------------------
+    # Original article text
+    # -----------------------------------------------------------------------
+    # Stored so Agent 2 can access context without a separate argument.
     article_text: str = ""
 
-    @field_validator("companies_named")
-    @classmethod
-    def companies_must_be_nonempty(cls, value: list[str]) -> list[str]:
-        if not value:
-            raise ValueError("no company identified - skip article")
-        return value
+    # -----------------------------------------------------------------------
+    # Validators
+    # -----------------------------------------------------------------------
 
     @field_validator("event_keywords")
     @classmethod

@@ -75,3 +75,34 @@ article. Write your analysis inside <think>...</think> tags. Consider:
 # of the three class labels: POSITIVE, NEGATIVE, NEUTRAL.
 # Must end with a space so the choice token aligns with BPE tokenisation.
 SENTIMENT_DECISION_PREFIX: str = "Sentiment: "
+
+# ---------------------------------------------------------------------------
+# Event type classification prompt (direct scoring, no CoT)
+# ---------------------------------------------------------------------------
+# Scores single-character tokens A-G using prompt_logprobs.
+# OTHER is deliberately excluded — it is assigned by Python post-processing
+# when confidence or margin falls below configured thresholds, preventing
+# OTHER from becoming a prior sink for the model.
+
+EVENT_TYPE_PROMPT: str = """\
+Classify the main financial event type.
+
+Choose the best matching category:
+A. Earnings, revenue, EPS, profit, or quarterly results
+B. Guidance, outlook, forecast, or management expectations
+C. Analyst rating, upgrade, downgrade, or price target change
+D. Legal, regulatory, investigation, lawsuit, fine, or approval
+E. Merger, acquisition, divestiture, takeover, or strategic stake
+F. Product launch, partnership, contract, customer win, or business update
+G. Macro, rates, inflation, commodity, market-wide, or policy event
+
+Text:
+{article_text}
+
+Answer:\
+"""
+
+# Appended to the event_type prompt to create the decision context for
+# prompt_logprobs scoring of tokens A-G.
+# Must end with a space so single-letter tokens are not BPE-merged.
+EVENT_TYPE_DECISION_PREFIX: str = "Answer: "

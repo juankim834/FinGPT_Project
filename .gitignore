@@ -37,3 +37,4 @@ dist/
 # macOS 系统生成的临时文件
 .DS_Store
 *.json
+backtesting_analysis/

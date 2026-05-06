@@ -1,406 +1,545 @@
-# FinGPT Two-Agent Signal Pipeline — Development Guide
+# FinGPT Part 2 Development Guide
 
-## Current State
+This document summarizes the current repository as it exists today and is intended to help development work move quickly without re-discovering the architecture.
 
-- Inference runs on a local vLLM instance (DeepSeek-R1-Distill-Llama-8B).
-- Agent 1 extracts a `NewsFingerprint` (facts + 3-class sentiment) using real model log-probabilities.
-- Agent 2 converts the fingerprint into a `TradingSignal` using real model log-probabilities + PMI prior correction.
-- Both agents use a two-phase vLLM approach: Phase 1 generates chain-of-thought (CoT) reasoning, Phase 2 scores choices via `prompt_logprobs`.
-- Backtest mode processes articles in batches of 10 (5 vLLM calls per batch).
-- `resume_backtest.ipynb` allows re-processing a previous result CSV without re-running Agent 2.
+## Repo Purpose
 
----
+This project implements a local, inference-only financial news pipeline:
 
-## 1) Architecture
+1. `Agent 1` extracts a structured `NewsFingerprint` from article text — including guided JSON fact extraction, logits-based sentiment classification, and logits-based event type classification.
+2. `Agent 2` receives only the ticker, headline, and Agent 1 structured fingerprint — and predicts a trading direction (BUY/HOLD/SELL) using A/B/C token logprobs.
+3. The `backtest` package runs the same pipeline over a labeled dataset and evaluates realized returns.
 
-### Signal generation (per article)
+The core design choice is that decisions are derived from real token log-probabilities read from vLLM, not from self-reported numbers produced by the model.
+
+## High-Level Architecture
+
+### Main flow
+
+- `pipeline.py`
+  - Live entry point.
+  - Fetches articles from Alpaca or Finnhub.
+  - Concatenates `headline + summary`.
+  - Runs `extract_fingerprint()` then `generate_signal()`.
+  - Saves results to `output/signals_<timestamp>.json`.
+
+### Agent 1
+
+- [agent1/extractor.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/agent1/extractor.py)
+  - Loads or reuses a local vLLM engine.
+  - Step 1: Guided decoding for structured JSON fact extraction (source, headline, companies_named).
+  - Step 2: Logits-based sentiment classification (POSITIVE / NEGATIVE / NEUTRAL) via CoT + prompt_logprobs.
+  - Step 3: Logits-based event type classification (A-G → EARNINGS / GUIDANCE / ANALYST_RATING / LEGAL_REGULATORY / MNA / PRODUCT_BUSINESS / MACRO) via direct prompt_logprobs (no CoT).
+  - OTHER is assigned by Python post-processing when confidence or margin is below threshold — it is never a model-scored token.
+  - Shared helpers: `_rank_probabilities`, `_apply_classification_thresholds`.
+  - Ticker fallback: if `companies_named` is empty and a ticker is available from the dataset, it is substituted.
+- [agent1/schema.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/agent1/schema.py)
+  - Defines `NewsFingerprint`.
+- [agent1/prompt.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/agent1/prompt.py)
+  - Extraction prompt, sentiment CoT/scoring prompts, event type classification prompt.
+
+### Agent 2
+
+- [agent2/reasoner.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/agent2/reasoner.py)
+  - Reuses Agent 1's vLLM engine when `SHARE_SINGLE_LLM_BETWEEN_AGENTS=true`.
+  - Receives only: ticker, headline, Agent 1 sentiment fields, Agent 1 event_type fields, companies_named.
+  - Does NOT receive the full article text, event keywords, or strategy tag prediction.
+  - Scores A/B/C logprobs (BUY/HOLD/SELL) using prompt_logprobs.
+  - Applies PMI correction: `adjusted = raw - pmi_alpha * null_logprobs`.
+  - Applies confidence/margin/direction threshold filters that can force HOLD.
+  - strategy_tag is always set to "event_driven" — it is not predicted by the model.
+  - Optional CoT mode (FINGPT_SIGNAL_USE_COT) for qualitative debugging.
+- [agent2/schema.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/agent2/schema.py)
+  - Defines `TradingSignal`.
+- [agent2/prompt.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/agent2/prompt.py)
+  - Compact direction-classification prompt (no-CoT and CoT variants), decision prefix, score tokens.
+
+### Shared logits helper
+
+- [vllm_logits_client.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/vllm_logits_client.py)
+  - Encapsulates the two-phase vLLM pattern:
+    - Phase 1: generate `<think>...</think>` reasoning.
+    - Phase 2: append a deterministic decision prefix and read prompt token logprobs.
+  - Supports both single-item and batched scoring.
+  - Contains a legacy self-reported-logits path kept mostly for reference, not the main pipeline.
+
+### Backtest
+
+- [backtest/backtester.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/backtest/backtester.py)
+  - Batch orchestration for end-to-end evaluation.
+  - Calls Agent 1 in batch, then Agent 2 in batch, then fetches realized returns.
+- [backtest/dataset_parser.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/backtest/dataset_parser.py)
+  - Loads `.csv`, `.parquet`, or Hugging Face datasets.
+  - Normalizes columns to `input`, `output`, `answer`, `ticker`.
+  - Extracts article text and date ranges from FinGPT-style prompts.
+- [backtest/price_fetcher.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/backtest/price_fetcher.py)
+  - Fetches daily data from `yfinance`.
+  - Computes close-to-close realized returns.
+  - Maintains both in-memory and disk caches.
+- [backtest/run_backtest.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/backtest/run_backtest.py)
+  - CLI wrapper for running backtests and printing metrics.
+
+### Ingestion
+
+- [ingestion/news_fetcher.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/ingestion/news_fetcher.py)
+  - Supports `alpaca` and `finnhub`.
+  - Finnhub path includes retry, pacing, and deduplication.
+
+## Data Contracts
+
+### `NewsFingerprint`
+
+Fields defined in `agent1/schema.py`:
+
+- Fact extraction fields:
+  - `source`
+  - `published_at`
+  - `headline`
+  - `companies_named` (may be empty; ticker fallback applied upstream)
+  - `event_keywords` (set to `[event_type.lower()]` for backward compat; optional, default `[]`)
+- Sentiment fields:
+  - `sentiment_label`: `POSITIVE | NEGATIVE | NEUTRAL`
+  - `sentiment_score`: `1.0 | 0.0 | -1.0`
+  - `sentiment_confidence`
+  - `sentiment_probabilities`
+  - `sentiment_logits`
+  - `calibration_T`
+- Event type fields (new):
+  - `event_type`: concrete label or `OTHER`
+  - `event_type_confidence`: top softmax probability (or None)
+  - `event_type_margin`: top1 − top2 margin (or None)
+  - `event_type_method`: `logits_accepted | abstained_low_confidence | abstained_low_margin | event_type_logits_failed`
+  - `event_type_logits`: raw log-probabilities keyed by token A-G
+  - `event_type_probabilities`: calibrated probabilities keyed by token A-G
+  - `secondary_event_type`: second-best concrete label
+  - `secondary_event_type_confidence`
+- Pass-through context:
+  - `article_text`
+
+Validation behavior:
+
+- `event_keywords` are normalized to lowercase.
+- `companies_named` validator removed — ticker fallback now applied in `_assemble_fingerprint` before construction.
+
+### `TradingSignal`
+
+Fields defined in `agent2/schema.py`:
+
+- `ticker`
+- `direction`: `long | short | neutral`
+- `strategy_tag`: always `"event_driven"` (fixed metadata, not a model prediction)
+- `confidence`
+- `cot`: empty string in no-CoT mode; reasoning text in CoT mode
+- Logits audit fields:
+  - `signal_logits`: PMI-adjusted logits
+  - `raw_signal_logits`: pre-PMI logits
+  - `signal_probabilities`
+  - `calibration_T`
+- Filter fields:
+  - `signal_filter_forced_hold`: True when a threshold override applied
+  - `signal_filter_reason`: `low_confidence | low_margin | buy_threshold | sell_threshold`
+
+## How Inference Actually Works
+
+### Agent 1 — three-step pipeline
+
+Agent 1 runs three logits-based classifiers per article.
+
+**Step 1: Fact extraction (guided decoding)**
+- Prompt: `EXTRACTION_PROMPT` + article text.
+- Guided JSON schema enforces output structure.
+- Output: source, headline, companies_named, event_keywords.
+
+**Step 2: Sentiment classification**
+- Phase 1: CoT generation prompt stops at `</think>`.
+- Phase 2: Scoring with `SENTIMENT_DECISION_PREFIX = "Sentiment: "` over tokens `[POSITIVE, NEGATIVE, NEUTRAL]`.
+- Python post-processing: `softmax(logits / CALIBRATION_T)` → label, confidence, probabilities.
+- Fallback on parse failure: uniform distribution, label = NEUTRAL.
+
+**Step 3: Event type classification**
+- Single-phase (no CoT): `EVENT_TYPE_PROMPT` scored directly via `prompt_logprobs`.
+- Score tokens: `["A", "B", "C", "D", "E", "F", "G"]` — no OTHER.
+- Token mapping (EVENT_TYPE_MAP):
+  - A → EARNINGS
+  - B → GUIDANCE
+  - C → ANALYST_RATING
+  - D → LEGAL_REGULATORY
+  - E → MNA
+  - F → PRODUCT_BUSINESS
+  - G → MACRO
+- Python post-processing:
+  - `softmax(logits / CALIBRATION_T)`
+  - `_rank_probabilities` → top_idx, second_idx, top_prob, second_prob, margin
+  - `_apply_classification_thresholds`:
+    - `top_prob < FINGPT_EVENT_TYPE_MIN_CONFIDENCE` → OTHER, method=abstained_low_confidence
+    - `margin < FINGPT_EVENT_TYPE_MIN_MARGIN` → OTHER, method=abstained_low_margin
+    - else → EVENT_TYPE_MAP[top_token], method=logits_accepted
+
+### Agent 2 — narrow direction classifier
+
+Agent 2 receives only: ticker, headline, and Agent 1's structured fingerprint.
+It does NOT receive the full article text, event keywords, or strategy tag prediction.
+
+**Prompt:** Compact template (`STRATEGY_PROMPT_NO_COT` or `STRATEGY_PROMPT_COT`) with fingerprint fields:
+- sentiment_label, sentiment_confidence, sentiment probabilities (p_pos, p_neu, p_neg)
+- event_type, event_type_confidence, event_type_margin, event_type_method
+- companies_named
+
+**Scoring:** Single-letter tokens `["A", "B", "C"]` via prompt_logprobs.
+- A → BUY → long
+- B → HOLD → neutral
+- C → SELL → short
+
+This avoids tokenization and prior-bias issues from directly scoring `BUY/HOLD/SELL`.
+
+**PMI correction with alpha:**
 
 ```
-News article text
-    │
-    ▼
-Agent 1 — extractor.py
-  ├─ Call 1: Guided decoding (StructuredOutputParams)
-  │           → raw facts: source, headline, companies, keywords
-  ├─ Call 2: CoT generation  stop=["</think>"]
-  │           → chain-of-thought sentiment reasoning
-  └─ Call 3: prompt_logprobs scoring × 3 (POSITIVE / NEGATIVE / NEUTRAL)
-              softmax(log_probs / CALIBRATION_T)  ← Python post-processing
-              → NewsFingerprint (sentiment_label, confidence, probabilities)
-    │
-    ▼
-Agent 2 — reasoner.py
-  ├─ Call 4: CoT generation  stop=["</think>"]
-  │           → chain-of-thought trading strategy reasoning
-  └─ Call 5: prompt_logprobs scoring × 3  ("A"=BUY / "B"=HOLD / "C"=SELL)
-              PMI correction: pmi[i] = logp[i] − null_logp[i]
-              softmax(pmi / CALIBRATION_T)  ← Python post-processing
-              → TradingSignal (direction, confidence, signal_probabilities)
-    │
-    ▼
-Price fetch — price_fetcher.py
-  yfinance interval="1d"  (5 trading days / 7-day window)
-  close-to-close realized return
-    │
-    ▼
-Metrics: direction_accuracy, Sharpe, total_pnl, vs_fingpt_accuracy
+adjusted_logit[t] = raw_logit[t] - FINGPT_PMI_ALPHA * null_logprob[t]
 ```
 
-**Batch processing:** articles are grouped in batches of 10; each batch makes 5 `engine.generate()` calls (not 5 × 10).
+- `FINGPT_PMI_ALPHA=1.0` (default) → full PMI correction.
+- `FINGPT_PMI_ALPHA=0.0` → no correction (raw logits only).
 
-### Backtest flow
+The null-context prior is:
+- Cached in memory for the active process.
+- Persisted to `PMI_PRIOR_PATH` on disk.
+- Invalidated automatically when model path, decision prefix, or score tokens change.
+- NOT invalidated by post-processing changes (pmi_alpha, calibration_T, thresholds).
 
-```
-HF dataset / local parquet / local CSV
-  → backtest/dataset_parser.py    (parses multi-headline blocks)
-  → backtest/backtester.py        (orchestrates batches)
-      ├─ extract_fingerprint_batch()
-      ├─ generate_signal_batch()
-      └─ get_realized_return()
-  → output/backtest_<timestamp>.csv + metrics dict
-```
-
-### Resume flow (no Agent 2 re-run)
+**Confidence/margin/direction filters** (applied after PMI + softmax):
 
 ```
-backtest_resume_*.csv  (has signal_logits column with A/B/C logprobs)
-  → notebooks/resume_backtest.ipynb  Track A
-      ├─ Empirical PMI correction  (mean-centre logits across rows)
-      ├─ Re-derive signal_direction / confidence / probabilities
-      ├─ Inline yfinance fetch  (interval="1d", cache cleared)
-      └─ Metrics + backtest_pmi_<timestamp>.csv
+if top_prob < FINGPT_SIGNAL_MIN_CONFIDENCE → force HOLD (low_confidence)
+elif margin < FINGPT_SIGNAL_MIN_MARGIN      → force HOLD (low_margin)
+elif top==A and prob[A] < FINGPT_BUY_THRESHOLD  → force HOLD (buy_threshold)
+elif top==C and prob[C] < FINGPT_SELL_THRESHOLD → force HOLD (sell_threshold)
 ```
 
----
+**strategy_tag** is always `"event_driven"` — not predicted by the model.
 
-## 2) Key Files
+If Agent 2 cannot parse the scoring result, it returns `None` and writes a diagnostic file.
 
-```
-FinGPT_Part2/
-├── config.py                    # Global constants, env-var loading
-├── pipeline.py                  # Live news → signal entry point
-├── vllm_logits_client.py        # vLLM wrapper: two-phase real logprobs + legacy
-│
-├── agent1/
-│   ├── extractor.py             # extract_fingerprint() / extract_fingerprint_batch()
-│   ├── prompt.py                # EXTRACTION_PROMPT, SENTIMENT_COT_PROMPT, SENTIMENT_DECISION_PREFIX
-│   └── schema.py                # NewsFingerprint (Pydantic)
-│
-├── agent2/
-│   ├── reasoner.py              # generate_signal() / generate_signal_batch() + PMI correction
-│   ├── prompt.py                # STRATEGY_COT_PROMPT, STRATEGY_DECISION_PREFIX, STRATEGY_SCORE_TOKENS
-│   └── schema.py                # TradingSignal (Pydantic)
-│
-├── backtest/
-│   ├── __init__.py
-│   ├── dataset_parser.py        # HF / parquet / CSV loading
-│   ├── price_fetcher.py         # yfinance daily-interval fetch + dual cache
-│   ├── backtester.py            # run_backtest() / compute_metrics()
-│   └── run_backtest.py          # CLI entry point
-│
-├── ingestion/
-│   └── news_fetcher.py          # Alpaca / Finnhub live news
-│
-├── evaluation/
-│   ├── evaluator.py
-│   └── collect_batch.py
-│
-├── notebooks/
-│   ├── demo.ipynb               # Full pipeline Colab demo
-│   └── resume_backtest.ipynb    # Post-process existing CSV (no GPU for Track A)
-│
-└── DEVELOPMENT.md
-```
+## Batch Behavior
 
----
+The repo is optimized around batching.
 
-## 3) Real Logprobs — Two-Phase Design
+### Agent 1 batch
 
-### Why not self-reported logits?
+`extract_fingerprint_batch(article_texts, tickers=None)` performs:
 
-Asking a local LLM to output `{"logits": [f1, f2, f3]}` produces numbers that correlate poorly with the model's actual token probabilities, because the model is predicting tokens in a conversational context, not introspecting its weights.
+1. One batched guided-decoding extraction call.
+2. One batched CoT + logprobs call for sentiment (2 vLLM calls internally).
+3. One batched direct logprobs call for event type (1 vLLM call — no CoT).
 
-### Two-phase approach
+`tickers` is an optional list used as companies_named fallback (dataset ticker fallback).
 
-**Phase 1 — CoT generation**
+### Agent 2 batch
 
-```python
-SamplingParams(max_tokens=1024, temperature=0.0, stop=["</think>"])
-```
+`generate_signal_batch(fingerprints)` performs:
 
-The model reasons freely inside `<think>…</think>` and stops before producing a commitment.
+In **CoT mode** (FINGPT_SIGNAL_USE_COT=True):
+1. One batched CoT generation call (stop at `</think>`).
+2. One batched A/B/C scoring call.
 
-**Phase 2 — Scoring via `prompt_logprobs`**
+In **no-CoT mode** (FINGPT_SIGNAL_USE_COT=False, default):
+1. One batched A/B/C scoring call (no Phase 1).
 
-For each candidate choice (e.g. "POSITIVE"):
+### Backtest batch size
 
-```python
-scoring_prompt = original_prompt + cot_text + "</think>\n" + decision_prefix + choice
-SamplingParams(prompt_logprobs=1, max_tokens=1, temperature=0.0)
-```
+- Controlled by `FINGPT_BACKTEST_BATCH_SIZE` env var (default 10).
+- Overridable via `--batch-size` CLI argument.
 
-vLLM always includes the actual prompt token's log-probability, so we read `log P(choice_token | context)` directly from the model's computation graph, not from the model's text generation.
+For each batch the practical flow is:
 
-For multi-token choices (e.g. "POSITIVE" → ["POS", "ITIVE"]), individual token logprobs are summed:
+1. Agent 1 fact extraction (guided decoding).
+2. Agent 1 sentiment logits.
+3. Agent 1 event type logits.
+4. Agent 2 direction logits (valid fingerprints only).
+5. Price fetch and metric assembly per row.
 
-```
-log P("POSITIVE" | ctx) = log P("POS" | ctx) + log P("ITIVE" | ctx + "POS")
-```
+## Configuration and Environment
 
-### Agent 1 scoring tokens
+Primary config lives in [config.py](/abs/path/C:/Project/FinGPT/FinGPT_Part2/config.py) and `.env`.
 
-`SENTIMENT_DECISION_PREFIX = "Sentiment: "`  
-Choices: `["POSITIVE", "NEGATIVE", "NEUTRAL"]`
+### Important environment variables
 
-The word "POSITIVE" tokenizes cleanly and has sufficiently distinct priors at this position.
+**Model and engine:**
 
-### Agent 2 scoring tokens and PMI correction
-
-**Problem:** After `"The answer is ("`, the token `"B"` has an unconditional LM prior of ~0.75 regardless of article content.  
-This swamps the news signal and causes HOLD to dominate.
-
-**Solution — A/B/C tokens + PMI correction:**
-
-```python
-STRATEGY_DECISION_PREFIX = "The answer is ("
-STRATEGY_SCORE_TOKENS    = ["A", "B", "C"]   # A=BUY, B=HOLD, C=SELL
-```
-
-Single ASCII letters have lower and more balanced priors than the words BUY/HOLD/SELL.  
-PMI correction removes whatever prior remains:
-
-```python
-# computed once per engine session with a neutral null article
-null_logprobs = _compute_null_logprobs()          # [logP(A|null), logP(B|null), logP(C|null)]
-
-# per article
-pmi_logits    = [raw[i] - null_logprobs[i] for i in range(3)]
-probs         = softmax(pmi_logits, T=CALIBRATION_T)
-strategy      = STRATEGY_SET[argmax(probs)]       # BUY / HOLD / SELL
-```
-
-Empirical PMI (Track A in `resume_backtest.ipynb`) estimates the null prior as the mean logprob across all articles in the CSV, requiring no model re-run.
-
----
-
-## 4) Agent Behavior
-
-### Agent 1 (`agent1/extractor.py`)
-
-- `extract_fingerprint(article_text) → Optional[NewsFingerprint]`
-- `extract_fingerprint_batch(articles) → list[Optional[NewsFingerprint]]`
-- Phase 1: guided JSON extraction (facts only, no sentiment).
-- Phase 2: sentiment CoT + `prompt_logprobs` scoring.
-- `set_shared_vllm_engine(engine)` injects a pre-loaded engine.
-- `get_shared_vllm_engine()` lets Agent 2 borrow the same engine.
-
-### Agent 2 (`agent2/reasoner.py`)
-
-- `generate_signal(fingerprint) → Optional[TradingSignal]`
-- `generate_signal_batch(fingerprints) → list[Optional[TradingSignal]]`
-- PMI null logprobs computed once on first call, cached in `_null_logprobs`.
-- `set_shared_vllm_engine(engine)` resets `_null_logprobs` (re-computed for new engine).
-- Strict mode: `None` returned if `parse_success=False`; diagnostic markdown saved to `FINGPT_DIAG_MD_DIR/agent2`.
-
-### `vllm_logits_client.py`
-
-Public functions:
-
-| Function | Purpose |
-|---|---|
-| `softmax(logits, temperature)` | Numerically stable softmax with temperature scaling |
-| `extract_thinking(raw_output)` | Extracts CoT text from `<think>…</think>` |
-| `get_real_choice_logits(...)` | Single-article two-phase logprob extraction (PRIMARY) |
-| `get_real_choice_logits_batch(...)` | Batch version — 2 `engine.generate()` calls for N articles (PRIMARY) |
-| `get_choice_logits(...)` | Legacy self-reported JSON logits (kept for reference) |
-| `get_choice_logits_batch(...)` | Legacy batch version (kept for reference) |
-
----
-
-## 5) Price Fetching
-
-`backtest/price_fetcher.py` computes close-to-close realized returns.
-
-**Key settings:**
-
-| Parameter | Value | Reason |
+| Variable | Default | Description |
 |---|---|---|
-| `interval` | `"1d"` | A 7-day date window with `"1wk"` returns at most 1 bar; daily gives 5 trading days |
-| MultiIndex flatten | `hist.columns.get_level_values(0)` | yfinance ≥0.2.38 returns `("Close","AXP")` columns for a single ticker |
+| `FINGPT_MODEL_PATH` | — | Required. Path to local model weights. |
+| `FINGPT_ADAPTER_PATH` | — | Present in config but not currently wired into model loading. |
+| `SHARE_SINGLE_LLM_BETWEEN_AGENTS` | `false` | Reuse Agent 1 vLLM engine in Agent 2. |
+| `FINGPT_CALIBRATION_T` | `1.2` | Softmax temperature for all classifiers. |
+| `FINGPT_LOGITS_MAX_TOKENS` | `1024` | CoT token budget for sentiment. |
+| `FINGPT_PMI_PRIOR_PATH` | `output/pmi_null_logprobs.json` | Disk cache for Agent 2 PMI prior. |
 
-**Two-level cache:**
+**Agent 1 — event type classifier:**
 
-- `_RETURN_CACHE` — in-memory `dict[tuple, float]`, lives for the Python process.
-- `_DISK_CACHE` — JSON file at `FINGPT_YF_CACHE_PATH` (default `output/yfinance_return_cache.json`).
-
-**Cache pitfall:** `_RETURN_CACHE` is module-level and persists across Jupyter cells in the same kernel session. If a previous run stored `None` values, subsequent calls return `None` from memory before fetching. Clear it explicitly when reusing a kernel:
-
-```python
-import backtest.price_fetcher as _pf
-_pf._RETURN_CACHE.clear()
-_pf._DISK_CACHE.clear()
-_pf._DISK_CACHE_LOADED = False
-```
-
-Or use the fresh cache path env var in the resume notebook:
-
-```python
-os.environ["FINGPT_YF_CACHE_PATH"] = "/tmp/yfinance_return_cache_resume.json"
-```
-
----
-
-## 6) vLLM Colab / Jupyter Compatibility
-
-**Problem:** vLLM ≥0.6 (v1 engine) spawns an `EngineCore` subprocess that calls `sys.stdout.fileno()`. IPython's `OutStream` has no real file descriptor → crash:
-
-```
-io.UnsupportedOperation: fileno
-```
-
-**Fix 1 — Disable multiprocessing (primary, set before any `LLM()` call):**
-
-```python
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-```
-
-Forces the v1 engine to use `InprocClient` (no subprocess, no `fileno` call).
-
-**Fix 2 — stdout redirect (belt-and-suspenders):**
-
-```python
-_nb_stdout = sys.stdout
-try:
-    sys.stdout = os.fdopen(os.dup(1), "w", buffering=1)   # real fd
-    engine = LLM(...)
-finally:
-    sys.stdout = _nb_stdout   # restore notebook stdout
-```
-
-If a subprocess is still spawned, it inherits a real file object and `fileno()` succeeds.
-
-Both fixes are applied in `demo.ipynb` Cell 3 (env) and Cell 4 (engine load), and in `resume_backtest.ipynb` Cell B2/B4.
-
----
-
-## 7) Config Constants (`config.py`)
-
-| Constant | Default | Purpose |
+| Variable | Default | Description |
 |---|---|---|
-| `FINGPT_MODEL_PATH` | `""` (env var) | Path to local HF-format model weights |
-| `SHARE_SINGLE_LLM_BETWEEN_AGENTS` | `False` | One vLLM engine shared by both agents |
-| `CALIBRATION_T` | `1.2` | Softmax temperature for logprob → probability |
-| `SENTIMENT_CLASSES` | `["POSITIVE","NEGATIVE","NEUTRAL"]` | Agent 1 scoring labels |
-| `STRATEGY_SET` | `["BUY","HOLD","SELL"]` | Agent 2 strategy labels (display) |
-| `LOGITS_MAX_TOKENS` | `1024` | CoT token budget per article |
-| `FINGPT_YF_CACHE_PATH` | `output/yfinance_return_cache.json` | Price cache disk path |
+| `FINGPT_EVENT_TYPE_MIN_CONFIDENCE` | `0.0` | Minimum softmax probability to accept a concrete label; below → OTHER. |
+| `FINGPT_EVENT_TYPE_MIN_MARGIN` | `0.0` | Minimum top1−top2 margin; below → OTHER. |
 
----
+**Agent 2 — PMI and signal filters:**
 
-## 8) Troubleshooting Playbook
+| Variable | Default | Description |
+|---|---|---|
+| `FINGPT_PMI_ALPHA` | `1.0` | Scaling factor for PMI correction. 0.0 = no correction. |
+| `FINGPT_SIGNAL_MIN_CONFIDENCE` | `0.0` | Force HOLD if top_prob < threshold. |
+| `FINGPT_SIGNAL_MIN_MARGIN` | `0.0` | Force HOLD if margin < threshold. |
+| `FINGPT_BUY_THRESHOLD` | `0.0` | Force HOLD if top==A and prob[A] < threshold. |
+| `FINGPT_SELL_THRESHOLD` | `0.0` | Force HOLD if top==C and prob[C] < threshold. |
+| `FINGPT_SIGNAL_USE_COT` | `false` | Enable CoT generation in Agent 2. Default false for backtest speed. |
 
-### A) `io.UnsupportedOperation: fileno` on `LLM()` init
+**Backtest:**
 
-**Cause:** vLLM v1 engine subprocess calls `sys.stdout.fileno()` in a Jupyter/Colab kernel.
+| Variable | Default | Description |
+|---|---|---|
+| `FINGPT_BACKTEST_STRICT_MODE` | `false` | Skip rows on any logits failure (vs. graceful fallback). |
+| `FINGPT_BACKTEST_BATCH_SIZE` | `10` | Articles per vLLM batch. Also overridable via `--batch-size`. |
 
-**Fix:** set `os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"` before importing vLLM, and wrap `LLM()` in the `sys.stdout` redirect pattern (see §6).
+**Data and diagnostics:**
 
----
+| Variable | Default | Description |
+|---|---|---|
+| `FINGPT_YF_CACHE_PATH` | — | Disk cache for realized returns from yfinance. |
+| `FINGPT_DIAG_MD_DIR` | `output/diagnostics_md` | Base directory for markdown debug outputs. |
+| `NEWS_PROVIDER` | `alpaca` | `alpaca` or `finnhub`. |
+| `ALPACA_API_KEY`, `ALPACA_API_SECRET` | — | Alpaca news API credentials. |
+| `FINNHUB_API_KEY` | — | Finnhub API key. |
+| `FINNHUB_TIMEOUT_SEC` | `15` | Finnhub request timeout. |
+| `FINNHUB_MAX_CALLS_PER_SEC` | `25` | Finnhub rate limit. |
+| `FINNHUB_MAX_RETRIES` | `3` | Finnhub retry count. |
+| `FINNHUB_RETRY_BASE_DELAY_SEC` | `0.5` | Finnhub retry base delay. |
 
-### B) Agent 2 always returns HOLD (neutral)
+### Notable config mismatch
 
-**Cause A:** Scoring words "BUY"/"HOLD"/"SELL" at `"Strategy: "` — the word "HOLD" has a strong LM prior at this position.
+`config.py` still defines Anthropic-related constants:
 
-**Fix:** Use `STRATEGY_SCORE_TOKENS = ["A","B","C"]` with `STRATEGY_DECISION_PREFIX = "The answer is ("`. ✓ Already applied.
+- `ANTHROPIC_API_KEY`
+- `CLAUDE_MODEL`
+- `CLAUDE_MAX_TOKENS`
+- `CLAUDE_THINKING_BUDGET`
 
-**Cause B:** Even A/B/C has a residual B-prior (~0.75). News signal cannot overcome it.
+But the active Agent 2 implementation in `agent2/reasoner.py` is local vLLM-based, not Anthropic-based. Those constants currently look like leftovers from an earlier design and should not be treated as part of the main runtime path.
 
-**Fix:** PMI correction — subtract null-context logprobs. ✓ Applied in `agent2/reasoner.py` (`_compute_null_logprobs` + `_null_logprobs` subtraction in `_process_signal_result`).
+## Runtime Outputs
 
-**Post-hoc fix (no model re-run):** Use Track A in `resume_backtest.ipynb` — empirical PMI from existing CSV logits.
+### Live pipeline output
 
----
+- JSON file in `output/signals_<timestamp>.json`
+- Each record is a serialized `TradingSignal`
 
-### C) All price fetches return `None` (`price_fetch_failed`)
+### Backtest output
 
-**Cause A:** `interval="1wk"` over a 7-day window → 1 weekly bar → `len < 2` guard.
+- CSV file, default `output/backtest_results.csv`
+- Row-level fields include:
+  - dataset metadata
+  - Agent 1 sentiment results
+  - Agent 2 signal results
+  - realized return
+  - position
+  - strategy return
+  - `skipped_reason`
 
-**Fix:** `interval="1d"` in `price_fetcher.py`. ✓ Applied.
+### Common skip reasons
 
-**Cause B:** `_RETURN_CACHE` stale from a previous kernel session run.
+- `fingerprint_failed` — Agent 1 fact extraction or assembly failed.
+- `event_type_logits_failed` — Event type logits failed AND `FINGPT_BACKTEST_STRICT_MODE=true`.
+- `signal_failed` — Agent 2 signal logits failed or parse error.
+- `price_fetch_failed` — Could not fetch realized return from yfinance.
 
-**Fix:** Clear the three module globals before fetching (see §5).
+### Diagnostics and logs
 
-**Cause C:** yfinance ≥0.2.38 MultiIndex columns — `hist["Close"]` returns a DataFrame.
+- Agent 1 markdown debug outputs:
+  - `<diag_dir>/agent1`
+- Agent 2 markdown debug outputs:
+  - `<diag_dir>/agent2`
+- Agent 2 failure diagnostics:
+  - `<diag_dir>/agent2_failures`
+- Agent 2 CoT logs:
+  - `logs/cot_<ticker>_<timestamp>.txt`
 
-**Fix:** `hist.columns = hist.columns.get_level_values(0)` before indexing. ✓ Applied.
+## Backtest Metrics
 
----
+`compute_metrics()` returns:
 
-### D) `ValueError: Unsupported dataset format`
+**Core:**
+- `total_rows`, `successful_rows`, `skip_rate`
+- `direction_accuracy`, `long_accuracy`, `short_accuracy`
+- `long_precision`, `short_precision`
+- `mean_strategy_return`, `std_strategy_return`
+- `total_pnl`, `gross_return`
+- `annualized_sharpe`
+- `max_drawdown`
+- `vs_fingpt_accuracy`
 
-**Cause:** Old `dataset_parser` module cached in kernel.
+**Trade counts:**
+- `long_trade_count`, `short_trade_count`, `neutral_count`
+- `num_trades` (long + short)
+- `coverage` (non-neutral rate)
+- `abstention_rate`
 
-**Fix:** `importlib.reload(backtest.dataset_parser)` or restart runtime.
+**Filter diagnostics:**
+- `signal_filter_forced_hold_rate`
 
----
+**Per event type (nested dict, key = event_type label):**
+- `event_type_breakdown`: `{event_type: {mean_return, n_rows}}`
 
-### E) `ValueError: The truth value of a Series is ambiguous`
+Direction labels are compared against realized movement computed by `direction_from_return()`, which uses a default neutral threshold of `0.001`.
 
-**Cause:** HF→pandas row value is `Series` (duplicate column labels), not scalar.
+## Dependencies
 
-**Fix:** Current parser normalises duplicate columns — ensure the latest `dataset_parser.py` is loaded.
+Dependencies are listed in `requirements.txt`. The main runtime groups are:
 
----
+- Model/runtime:
+  - `transformers`
+  - `torch`
+  - `peft`
+  - vLLM is required by the code but is not listed in `requirements.txt`; it must be installed separately in the execution environment.
+- Data and evaluation:
+  - `pandas`
+  - `pyarrow`
+  - `datasets`
+  - `yfinance`
+- Infra:
+  - `python-dotenv`
+  - `requests`
+  - `pydantic`
+- Dev:
+  - `pytest`
+  - `notebook`
 
-### F) Agent 2 diagnostic markdown contains only reasoning, no structured output
+## Entry Points Developers Will Actually Use
 
-**Cause:** Legacy path (self-reported logits) or model output cut off by `max_tokens`.
-
-**Fix:** The real-logprobs path (`get_real_choice_logits`) does not require the model to produce structured output — diagnosis is different. Check `parse_success` field in the result dict; if `False`, vLLM `prompt_logprobs` indexing may have failed (BPE boundary issue). Increase `LOGITS_MAX_TOKENS` or inspect `_sum_choice_logprob` warnings in the log.
-
----
-
-## 9) Operational Recommendations
-
-- Use `SHARE_SINGLE_LLM_BETWEEN_AGENTS=true` on Colab to halve GPU memory pressure.
-- Set `VLLM_ENABLE_V1_MULTIPROCESSING=0` before any `LLM()` call in notebooks.
-- Keep `CALIBRATION_T=1.2`; values < 1 sharpen distributions but can over-commit.
-- Keep PMI correction enabled — turning it off restores the HOLD-dominance bias.
-- Track skip reasons (`fingerprint_failed`, `signal_failed`, `price_fetch_failed`) as pipeline health signals.
-- Use a fresh `FINGPT_YF_CACHE_PATH` per resume run to avoid stale None entries.
-
----
-
-## 10) Quick Commands
-
-Run full backtest from CLI:
+### Run the live pipeline
 
 ```bash
-python -m backtest.run_backtest \
-  --dataset "FinGPT/fingpt-forecaster-dow30-202305-202405" \
-  --metrics
+python pipeline.py AAPL MSFT NVDA
 ```
 
-Run a subset:
+### Run a full backtest
 
 ```bash
+python -m backtest.run_backtest --dataset "FinGPT/fingpt-forecaster-dow30-202305-202405" --metrics
+```
+
+### Run a smaller smoke-test backtest
+
+```bash
+python -m backtest.run_backtest --dataset "FinGPT/fingpt-forecaster-dow30-202305-202405" --max-rows 50 --metrics
+```
+
+### Run a no-CoT backtest with filters
+
+```bash
+FINGPT_SIGNAL_USE_COT=false \
+FINGPT_EVENT_TYPE_MIN_CONFIDENCE=0.35 \
+FINGPT_EVENT_TYPE_MIN_MARGIN=0.05 \
+FINGPT_SIGNAL_MIN_CONFIDENCE=0.40 \
+FINGPT_SIGNAL_MIN_MARGIN=0.05 \
 python -m backtest.run_backtest \
   --dataset "FinGPT/fingpt-forecaster-dow30-202305-202405" \
   --max-rows 50 --metrics
 ```
 
-Reload modules in a live Colab kernel after code changes:
+### Run a CoT debug session
 
-```python
-import importlib
-import agent1.prompt, agent1.extractor
-import agent2.prompt, agent2.reasoner
-import backtest.dataset_parser, backtest.price_fetcher, backtest.backtester
-import vllm_logits_client
-
-for m in [agent1.prompt, agent1.extractor, agent2.prompt, agent2.reasoner,
-          backtest.dataset_parser, backtest.price_fetcher, backtest.backtester,
-          vllm_logits_client]:
-    importlib.reload(m)
+```bash
+FINGPT_SIGNAL_USE_COT=true \
+python -m backtest.run_backtest \
+  --dataset "FinGPT/fingpt-forecaster-dow30-202305-202405" \
+  --max-rows 10 --metrics
 ```
+
+### Use a custom local dataset and output path
+
+```bash
+python -m backtest.run_backtest --dataset "your_data.csv" --output "output/my_backtest.csv" --metrics
+```
+
+### Override batch size
+
+```bash
+python -m backtest.run_backtest --dataset "..." --batch-size 20 --metrics
+```
+
+## Where To Change Things
+
+### Change extraction behavior
+
+- Prompting: `agent1/prompt.py`
+- Parsing/validation: `agent1/extractor.py`, `agent1/schema.py`
+
+### Change sentiment classes or calibration
+
+- Class order: `config.py`
+- Decision prefix / scoring prompt: `agent1/prompt.py`
+- Softmax behavior: `vllm_logits_client.py` and `agent1/extractor.py`
+
+### Change trading decision behavior
+
+- Strategy prompt and score tokens: `agent2/prompt.py`
+- Strategy mapping and PMI logic: `agent2/reasoner.py`
+- Signal schema: `agent2/schema.py`
+
+### Change batch size or result assembly
+
+- `backtest/backtester.py`
+
+### Change market data behavior
+
+- `backtest/price_fetcher.py`
+
+### Change live news provider behavior
+
+- `ingestion/news_fetcher.py`
+
+## Current Caveats and Development Notes
+
+### 1. Tests cover deterministic logic only
+
+The tests under `tests/test_extractor.py` and `tests/test_reasoner.py` test pure-Python post-processing:
+- `_rank_probabilities`, `_apply_classification_thresholds`, `_process_event_type_result`
+- `_process_signal_result` (via module-level patching of config constants)
+- EVENT_TYPE_CLASSES/MAP invariants (no OTHER token, correct label mapping)
+- Ticker fallback in `_assemble_fingerprint`
+- PMI alpha, confidence/margin/direction filters
+
+vLLM is not imported or mocked in these tests — they run without GPU.
+
+### 2. README and comments may still reflect transitional design history
+
+Some repo text still references older assumptions or intermediate states. When in doubt, treat the runtime code in:
+
+- `agent1/extractor.py`
+- `agent2/reasoner.py`
+- `vllm_logits_client.py`
+- `backtest/backtester.py`
+
+as the source of truth.
+
+### 3. `FINGPT_ADAPTER_PATH` is not currently used in model loading
+
+It is exposed in config and `.env.example`, but the current `_load_model()` implementations do not apply a LoRA adapter path.
+
+### 4. vLLM is a hard runtime dependency
+
+The main code imports vLLM dynamically, but the environment must provide it. This is especially important when recreating the project outside the notebook environment.
+
+## Recommended Development Workflow
+
+1. Start from `config.py`, `.env.example`, and the relevant entry point.
+2. For inference changes, trace:
+   - prompt file
+   - schema file
+   - extractor/reasoner
+   - `vllm_logits_client.py`
+3. For evaluation changes, trace:
+   - `dataset_parser.py`
+   - `backtester.py`
+   - `price_fetcher.py`
+4. Treat tests as needing modernization before using them as a safety net.
+5. Use the notebooks mainly for experiments and reruns, not as the primary source of architecture truth.

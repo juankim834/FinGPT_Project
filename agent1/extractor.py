@@ -1,17 +1,21 @@
 """
-agent1/extractor.py — Agent 1: FinGPT fact extractor + logits-based sentiment.
+agent1/extractor.py — Agent 1: FinGPT fact extractor + logits-based sentiment + event_type.
 
 Pipeline per article
 --------------------
 1. Fact extraction  — guided-decoding vLLM call → JSON (source, headline, …).
-2. Sentiment scoring — CoT vLLM call → self-reported logits for
+2. Sentiment scoring — CoT vLLM call → real token logprobs for
                        [POSITIVE, NEGATIVE, NEUTRAL].
-3. Deterministic post-processing — softmax(logits / CALIBRATION_T) →
-                       probabilities, confidence, label.
-4. Return a NewsFingerprint that combines facts + calibrated sentiment.
+3. Event type scoring — direct scoring vLLM call → real token logprobs for
+                       [A, B, C, D, E, F, G] mapped to concrete event categories.
+4. Deterministic post-processing — softmax(logits / CALIBRATION_T) →
+                       probabilities, confidence, label; threshold-based
+                       abstention assigns OTHER when confidence or margin is low.
+5. Return a NewsFingerprint that combines facts + calibrated sentiment +
+   calibrated event_type.
 
 The LLM never outputs a final sentiment label, probability, or confidence
-value — all of those are computed in Python from the raw logits.
+value — all of those are computed in Python from the real logits.
 """
 
 import json
@@ -24,12 +28,18 @@ from typing import Any, Optional
 
 from config import (
     CALIBRATION_T,
+    EVENT_TYPE_CLASSES,
+    EVENT_TYPE_MAP,
+    FINGPT_EVENT_TYPE_MIN_CONFIDENCE,
+    FINGPT_EVENT_TYPE_MIN_MARGIN,
     FINGPT_MODEL_PATH,
     LOG_LEVEL,
     LOGITS_MAX_TOKENS,
     SENTIMENT_CLASSES,
 )
 from agent1.prompt import (
+    EVENT_TYPE_DECISION_PREFIX,
+    EVENT_TYPE_PROMPT,
     EXTRACTION_PROMPT,
     SENTIMENT_COT_PROMPT,
     SENTIMENT_DECISION_PREFIX,
@@ -389,6 +399,60 @@ def _save_md_debug_output(
 
 
 # ---------------------------------------------------------------------------
+# Shared classification helpers (used by both sentiment and event_type)
+# ---------------------------------------------------------------------------
+
+def _rank_probabilities(
+    probs: list[float],
+    labels: list[str],
+) -> tuple[int, int, float, float, float]:
+    """
+    Rank calibrated probabilities and return key statistics.
+
+    Returns
+    -------
+    (top_idx, second_idx, top_prob, second_prob, margin)
+        top_idx    — index of the highest-probability class.
+        second_idx — index of the second-highest class.
+        top_prob   — probability of the top class.
+        second_prob — probability of the second class.
+        margin     — top_prob − second_prob.
+    """
+    if len(probs) < 2:
+        top_idx = 0
+        return top_idx, 0, probs[0] if probs else 0.0, 0.0, probs[0] if probs else 0.0
+
+    indexed = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)
+    top_idx, top_prob = indexed[0]
+    second_idx, second_prob = indexed[1]
+    margin = top_prob - second_prob
+    return top_idx, second_idx, top_prob, second_prob, margin
+
+
+def _apply_classification_thresholds(
+    top_token: str,
+    top_prob: float,
+    margin: float,
+    min_confidence: float,
+    min_margin: float,
+    label_map: dict[str, str],
+) -> tuple[str, str]:
+    """
+    Apply confidence and margin thresholds to decide whether to accept a
+    concrete label or abstain to OTHER.
+
+    Returns
+    -------
+    (event_type, event_type_method)
+    """
+    if top_prob < min_confidence:
+        return "OTHER", "abstained_low_confidence"
+    if margin < min_margin:
+        return "OTHER", "abstained_low_margin"
+    return label_map[top_token], "logits_accepted"
+
+
+# ---------------------------------------------------------------------------
 # Sentiment post-processing (shared by single-item and batch paths)
 # ---------------------------------------------------------------------------
 
@@ -451,6 +515,88 @@ def _process_sentiment_result(
 
 
 # ---------------------------------------------------------------------------
+# Event type post-processing (shared by single-item and batch paths)
+# ---------------------------------------------------------------------------
+
+def _process_event_type_result(
+    result: dict[str, Any],
+    article_text: str,
+    *,
+    save_debug: bool = True,
+    min_confidence: float = FINGPT_EVENT_TYPE_MIN_CONFIDENCE,
+    min_margin: float = FINGPT_EVENT_TYPE_MIN_MARGIN,
+) -> dict[str, Any]:
+    """
+    Convert a ``get_real_choice_logits`` result dict into the event_type
+    sub-dict used when building a ``NewsFingerprint``.
+
+    Tokens A-G are scored; OTHER is assigned by Python when the confidence
+    or margin thresholds are not met.  Designed to be called identically by
+    the single-item path and the batch path.
+    """
+    if save_debug:
+        _save_md_debug_output(
+            article_text,
+            result["raw_output"],
+            "event_type",
+            1,
+            LOGITS_MAX_TOKENS,
+        )
+
+    if result["parse_success"] and result["logits"] is not None:
+        logits: list[float] = result["logits"]
+        probs = softmax(logits, temperature=CALIBRATION_T)
+        top_idx, second_idx, top_prob, second_prob, margin = _rank_probabilities(
+            probs, EVENT_TYPE_CLASSES
+        )
+        top_token = EVENT_TYPE_CLASSES[top_idx]
+        second_token = EVENT_TYPE_CLASSES[second_idx]
+
+        event_type, method = _apply_classification_thresholds(
+            top_token, top_prob, margin, min_confidence, min_margin, EVENT_TYPE_MAP
+        )
+        secondary_event_type = EVENT_TYPE_MAP[second_token]
+        secondary_conf = round(second_prob, 6)
+
+        logits_dict = dict(zip(EVENT_TYPE_CLASSES, logits))
+        probs_dict = {k: round(v, 6) for k, v in zip(EVENT_TYPE_CLASSES, probs)}
+
+        logger.info(
+            "Event type logits=%s  probs=%s  top=%s(%s)  conf=%.4f  margin=%.4f  method=%s",
+            [f"{l:.4f}" for l in logits],
+            [f"{p:.4f}" for p in probs],
+            top_token,
+            event_type,
+            top_prob,
+            margin,
+            method,
+        )
+    else:
+        logger.warning(
+            "Event type logits parse failed; assigning OTHER."
+        )
+        event_type = "OTHER"
+        method = "event_type_logits_failed"
+        logits_dict = None
+        probs_dict = None
+        top_prob = None
+        margin = None
+        secondary_event_type = None
+        secondary_conf = None
+
+    return {
+        "event_type": event_type,
+        "event_type_confidence": round(top_prob, 6) if top_prob is not None else None,
+        "event_type_margin": round(margin, 6) if margin is not None else None,
+        "event_type_method": method,
+        "event_type_logits": logits_dict,
+        "event_type_probabilities": probs_dict,
+        "secondary_event_type": secondary_event_type,
+        "secondary_event_type_confidence": secondary_conf,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Sentiment scoring — logits-based (single-item)
 # ---------------------------------------------------------------------------
 
@@ -486,27 +632,89 @@ def _score_sentiment(article_text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Event type scoring — logits-based (single-item)
+# ---------------------------------------------------------------------------
+
+def _score_event_type(article_text: str) -> dict[str, Any]:
+    """
+    Extract real model log-probabilities for each of the 7 event type tokens.
+
+    Uses direct prompt_logprobs scoring (no CoT) — the event_type prompt is
+    concise and self-contained.  Score tokens are A-G; OTHER is never scored
+    by the model and is assigned by Python via threshold logic.
+
+    Output logic is fully delegated to ``_process_event_type_result``.
+    """
+    _ensure_chat_tokenizer()
+    if _chat_tokenizer is None:
+        raise RuntimeError(
+            "Tokenizer not loaded — cannot compute real choice logprobs. "
+            "Ensure FINGPT_MODEL_PATH is set before calling extract_fingerprint."
+        )
+
+    event_prompt_text = EVENT_TYPE_PROMPT.format(article_text=article_text)
+    prompt = _format_chat_prompt("", event_prompt_text)
+
+    result = get_real_choice_logits(
+        engine=_vllm_engine,
+        cot_prompt=prompt,
+        choices=EVENT_TYPE_CLASSES,
+        decision_prefix=EVENT_TYPE_DECISION_PREFIX,
+        tokenizer=_chat_tokenizer,
+        max_cot_tokens=0,   # no CoT for event_type — score directly
+        use_cot=False,
+    )
+    return _process_event_type_result(result, article_text)
+
+
+# ---------------------------------------------------------------------------
 # Fingerprint assembly (shared by single-item and batch paths)
 # ---------------------------------------------------------------------------
 
 def _assemble_fingerprint(
     extracted: dict[str, Any],
     sentiment: dict[str, Any],
+    event_type: dict[str, Any],
     article_text: str,
+    fallback_ticker: Optional[str] = None,
 ) -> NewsFingerprint:
-    """Build a ``NewsFingerprint`` from fact-extraction + sentiment dicts."""
+    """
+    Build a ``NewsFingerprint`` from fact-extraction, sentiment, and event_type dicts.
+
+    If ``companies_named`` is empty and ``fallback_ticker`` is provided,
+    the ticker is substituted to avoid dropping otherwise valid rows.
+    ``event_keywords`` is set to ``[event_type]`` for backward compatibility.
+    """
+    companies_named = extracted.get("companies_named", [])
+    if not companies_named and fallback_ticker:
+        companies_named = [fallback_ticker]
+        logger.info(
+            "companies_named empty; using dataset ticker fallback: %s", fallback_ticker
+        )
+
+    et = event_type.get("event_type", "OTHER")
     payload: dict[str, Any] = {
         "source": extracted.get("source", ""),
         "published_at": extracted.get("published_at", ""),
         "headline": extracted.get("headline", ""),
-        "companies_named": extracted.get("companies_named", []),
-        "event_keywords": extracted.get("event_keywords", []),
+        "companies_named": companies_named,
+        # Backward compat: set to [event_type] so downstream code that reads
+        # event_keywords still gets a meaningful single-item list.
+        "event_keywords": [et.lower()],
         "sentiment_label": sentiment["sentiment_label"],
         "sentiment_score": sentiment["sentiment_score"],
         "sentiment_confidence": sentiment["sentiment_confidence"],
         "sentiment_probabilities": sentiment["sentiment_probabilities"],
         "sentiment_logits": sentiment["sentiment_logits"],
         "calibration_T": sentiment["calibration_T"],
+        "event_type": et,
+        "event_type_confidence": event_type.get("event_type_confidence"),
+        "event_type_margin": event_type.get("event_type_margin"),
+        "event_type_method": event_type.get("event_type_method"),
+        "event_type_logits": event_type.get("event_type_logits"),
+        "event_type_probabilities": event_type.get("event_type_probabilities"),
+        "secondary_event_type": event_type.get("secondary_event_type"),
+        "secondary_event_type_confidence": event_type.get("secondary_event_type_confidence"),
         "article_text": article_text,
     }
     return NewsFingerprint(**payload)
@@ -523,17 +731,27 @@ def _build_extraction_prompt(article_text: str) -> str:
 
 def extract_fingerprint_batch(
     article_texts: list[str],
+    tickers: Optional[list[str]] = None,
 ) -> list[Optional[NewsFingerprint]]:
     """
     Batch version of ``extract_fingerprint``.
 
-    Sends all articles to vLLM in **two batched calls**:
+    Sends all articles to vLLM in **three batched call-pairs**:
       1. Guided fact-extraction call (all articles, single ``SamplingParams``).
       2. Sentiment CoT + logits call (all articles, single ``SamplingParams``).
+      3. Event type direct logits call (all articles, single ``SamplingParams``).
 
     Per-item output logic (softmax, argmax, ``NewsFingerprint`` assembly) is
-    identical to the single-item path — handled by ``_process_sentiment_result``
-    and ``_assemble_fingerprint``.
+    identical to the single-item path — handled by ``_process_sentiment_result``,
+    ``_process_event_type_result``, and ``_assemble_fingerprint``.
+
+    Parameters
+    ----------
+    article_texts:
+        Raw news article strings.
+    tickers:
+        Optional list of tickers (same length as article_texts) used as
+        fallback when companies_named is empty (dataset ticker fallback).
 
     Returns a list of the same length as *article_texts*.  Items are ``None``
     wherever extraction or validation fails.
@@ -550,6 +768,13 @@ def extract_fingerprint_batch(
     n = len(article_texts)
     if n == 0:
         return []
+
+    if tickers is not None and len(tickers) != n:
+        logger.warning(
+            "tickers length (%d) != article_texts length (%d); ignoring tickers.",
+            len(tickers), n,
+        )
+        tickers = None
 
     from vllm import SamplingParams  # type: ignore
 
@@ -571,8 +796,6 @@ def extract_fingerprint_batch(
     ]
 
     # --- Step 2: Batch real logprobs for sentiment (2 vLLM calls internally) ---
-    # Phase 1 (CoT generation) + Phase 2 (N×K scoring prompts) are both
-    # handled inside get_real_choice_logits_batch as single batched calls.
     cot_prompts = [
         _format_chat_prompt("", SENTIMENT_COT_PROMPT.format(article_text=t))
         for t in article_texts
@@ -586,9 +809,25 @@ def extract_fingerprint_batch(
         max_cot_tokens=LOGITS_MAX_TOKENS,
     )
 
-    # --- Step 3: Per-item assembly (output logic unchanged) ---
+    # --- Step 3: Batch real logprobs for event_type (1 vLLM call — no CoT) ---
+    event_type_prompts = [
+        _format_chat_prompt("", EVENT_TYPE_PROMPT.format(article_text=t))
+        for t in article_texts
+    ]
+    event_type_results = get_real_choice_logits_batch(
+        engine=_vllm_engine,
+        cot_prompts=event_type_prompts,
+        choices=EVENT_TYPE_CLASSES,
+        decision_prefix=EVENT_TYPE_DECISION_PREFIX,
+        tokenizer=_chat_tokenizer,
+        max_cot_tokens=0,
+        use_cot=False,
+    )
+
+    # --- Step 4: Per-item assembly (output logic unchanged) ---
     fingerprints: list[Optional[NewsFingerprint]] = []
     for i, article_text in enumerate(article_texts):
+        fallback_ticker = tickers[i] if tickers else None
         try:
             clean_extraction = _normalize_generated_text(raw_extractions[i])
             _save_md_debug_output(article_text, clean_extraction, "extraction", 1, 2048)
@@ -601,8 +840,13 @@ def extract_fingerprint_batch(
             sentiment = _process_sentiment_result(
                 sentiment_results[i], article_text, save_debug=True
             )
+            event_type = _process_event_type_result(
+                event_type_results[i], article_text, save_debug=True
+            )
 
-            fingerprints.append(_assemble_fingerprint(extracted, sentiment, article_text))
+            fingerprints.append(
+                _assemble_fingerprint(extracted, sentiment, event_type, article_text, fallback_ticker)
+            )
         except Exception as exc:
             logger.error(
                 "extract_fingerprint_batch[%d] failed: %s", i, exc, exc_info=True
@@ -612,9 +856,21 @@ def extract_fingerprint_batch(
     return fingerprints
 
 
-def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
+def extract_fingerprint(
+    article_text: str,
+    ticker: Optional[str] = None,
+) -> Optional[NewsFingerprint]:
     """
-    Extract structured facts and logits-based sentiment from a raw news article.
+    Extract structured facts, logits-based sentiment, and logits-based event_type
+    from a raw news article.
+
+    Parameters
+    ----------
+    article_text:
+        Raw news article text.
+    ticker:
+        Optional ticker used as companies_named fallback when the model
+        fails to extract any company name.
 
     Returns None on any model, parse, or validation failure.
     """
@@ -642,7 +898,10 @@ def extract_fingerprint(article_text: str) -> Optional[NewsFingerprint]:
         # Logits-based sentiment scoring.
         sentiment = _score_sentiment(article_text)
 
-        return _assemble_fingerprint(extracted, sentiment, article_text)
+        # Logits-based event_type scoring.
+        event_type = _score_event_type(article_text)
+
+        return _assemble_fingerprint(extracted, sentiment, event_type, article_text, ticker)
 
     except Exception as exc:
         logger.error("extract_fingerprint failed: %s", exc, exc_info=True)

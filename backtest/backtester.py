@@ -15,13 +15,14 @@ from agent1.extractor import extract_fingerprint_batch
 from agent2.reasoner import generate_signal_batch
 from backtest.dataset_parser import build_backtest_rows, load_dataset
 from backtest.price_fetcher import direction_from_return, get_realized_return
-from config import LOG_LEVEL
+from config import (
+    FINGPT_BACKTEST_BATCH_SIZE,
+    FINGPT_BACKTEST_STRICT_MODE,
+    LOG_LEVEL,
+)
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
-
-
-_BATCH_SIZE = 10
 
 
 def _position_from_direction(direction: str) -> int:
@@ -39,16 +40,29 @@ def _make_base_result(row: dict) -> dict:
         "end_date": row["end_date"],
         "article_text": row["article_text"][:120],
         "fingpt_label": row["fingpt_label"],
-        # Agent 1 sentiment (logits-derived)
+        # Agent 1 — sentiment (logits-derived)
         "sentiment_label": None,
         "sentiment_confidence": None,
-        "sentiment_probabilities": None,
-        # Agent 2 signal (logits-derived)
+        "sentiment_prob_positive": None,
+        "sentiment_prob_neutral": None,
+        "sentiment_prob_negative": None,
+        # Agent 1 — event type (logits-derived)
+        "event_type": None,
+        "event_type_confidence": None,
+        "event_type_margin": None,
+        "event_type_method": None,
+        "event_type_probabilities": None,
+        "secondary_event_type": None,
+        "secondary_event_type_confidence": None,
+        # Agent 2 — signal (logits-derived)
         "signal_direction": None,
         "signal_confidence": None,
-        "signal_strategy_tag": None,
+        "strategy_tag": None,
+        "signal_raw_logits": None,
         "signal_logits": None,
         "signal_probabilities": None,
+        "signal_filter_forced_hold": None,
+        "signal_filter_reason": None,
         # Backtest metrics
         "realized_return": None,
         "position": None,
@@ -61,18 +75,40 @@ def run_backtest(
     dataset_path: str,
     output_path: str = "output/backtest_results.csv",
     max_rows: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Run the full news2signal pipeline and persist detailed results.
 
-    vLLM inference runs in batches of ``_BATCH_SIZE`` (default 10).  Each batch
-    makes three vLLM calls:
+    vLLM inference runs in batches of ``batch_size`` (default from config).
+    Each batch makes these vLLM call groups:
       1. Guided fact-extraction (all articles in the batch, single call).
       2. Sentiment CoT + logits (all articles in the batch, single call).
-      3. Strategy CoT + logits (valid fingerprints only, single call).
-    Per-item result assembly, price fetching, and CSV serialisation are
-    unchanged from the single-item version.
+      3. Event type direct logits (all articles in the batch, single call).
+      4. Strategy logits (valid fingerprints only, single call; CoT optional).
+
+    Parameters
+    ----------
+    dataset_path:
+        Path to the parquet/CSV dataset.
+    output_path:
+        Where to write the result CSV.
+    max_rows:
+        Optional cap for quick tests.
+    batch_size:
+        Override FINGPT_BACKTEST_BATCH_SIZE from config.
+
+    Strict mode (FINGPT_BACKTEST_STRICT_MODE):
+      - fingerprint_failed       → skip row
+      - event_type_logits_failed → skip row
+      - signal_logits_failed     → skip row
+    Non-strict mode:
+      - fingerprint_failed → skip row (always — no fingerprint, no signal)
+      - event_type_logits_failed → keep row with event_type=OTHER
+      - signal_logits_failed → skip row
     """
+    effective_batch_size = batch_size if batch_size is not None else FINGPT_BACKTEST_BATCH_SIZE
+
     df = load_dataset(dataset_path)
     rows = build_backtest_rows(df)
     if max_rows is not None:
@@ -81,17 +117,20 @@ def run_backtest(
     results: list[dict] = []
     total = len(rows)
 
-    for batch_start in range(0, total, _BATCH_SIZE):
-        batch = rows[batch_start : batch_start + _BATCH_SIZE]
+    for batch_start in range(0, total, effective_batch_size):
+        batch = rows[batch_start : batch_start + effective_batch_size]
         batch_end = batch_start + len(batch)
         logger.info(
             "Backtest progress: rows %d–%d / %d", batch_start + 1, batch_end, total
         )
 
-        # --- Agent 1: batch extract fingerprints (2 vLLM calls) ---
+        batch_tickers = [r["ticker"] for r in batch]
+
+        # --- Agent 1: batch extract fingerprints (3 vLLM call groups) ---
         try:
             fingerprints = extract_fingerprint_batch(
-                [r["article_text"] for r in batch]
+                [r["article_text"] for r in batch],
+                tickers=batch_tickers,
             )
         except Exception as exc:
             logger.exception(
@@ -100,7 +139,17 @@ def run_backtest(
             )
             fingerprints = [None] * len(batch)
 
-        # --- Agent 2: batch generate signals (1 vLLM call, valid FPs only) ---
+        # --- Strict mode: check event_type failures ---
+        if FINGPT_BACKTEST_STRICT_MODE:
+            for j, fp in enumerate(fingerprints):
+                if fp is not None and fp.event_type_method == "event_type_logits_failed":
+                    fingerprints[j] = None
+                    logger.info(
+                        "Strict mode: skipping row %d (event_type_logits_failed).",
+                        batch_start + j + 1,
+                    )
+
+        # --- Agent 2: batch generate signals (valid FPs only) ---
         valid_pairs: list[tuple[int, object]] = [
             (j, fp) for j, fp in enumerate(fingerprints) if fp is not None
         ]
@@ -118,7 +167,7 @@ def run_backtest(
             for k, j in enumerate(valid_indices):
                 batch_signals[j] = raw_signals[k]
 
-        # --- Per-row result assembly (output logic unchanged) ---
+        # --- Per-row result assembly ---
         for j, row in enumerate(batch):
             base_result = _make_base_result(row)
             fingerprint = fingerprints[j]
@@ -130,28 +179,55 @@ def run_backtest(
                     results.append(base_result)
                     continue
 
+                # Fill Agent 1 fields.
                 base_result["sentiment_label"] = fingerprint.sentiment_label
                 base_result["sentiment_confidence"] = fingerprint.sentiment_confidence
-                base_result["sentiment_probabilities"] = str(
-                    fingerprint.sentiment_probabilities
+                sp = fingerprint.sentiment_probabilities or {}
+                base_result["sentiment_prob_positive"] = sp.get("POSITIVE")
+                base_result["sentiment_prob_neutral"] = sp.get("NEUTRAL")
+                base_result["sentiment_prob_negative"] = sp.get("NEGATIVE")
+
+                base_result["event_type"] = fingerprint.event_type
+                base_result["event_type_confidence"] = fingerprint.event_type_confidence
+                base_result["event_type_margin"] = fingerprint.event_type_margin
+                base_result["event_type_method"] = fingerprint.event_type_method
+                base_result["event_type_probabilities"] = str(
+                    fingerprint.event_type_probabilities
+                ) if fingerprint.event_type_probabilities else None
+                base_result["secondary_event_type"] = fingerprint.secondary_event_type
+                base_result["secondary_event_type_confidence"] = (
+                    fingerprint.secondary_event_type_confidence
                 )
+
+                # Strict mode: skip if event_type_logits_failed.
+                if (
+                    FINGPT_BACKTEST_STRICT_MODE
+                    and fingerprint.event_type_method == "event_type_logits_failed"
+                ):
+                    base_result["skipped_reason"] = "event_type_logits_failed"
+                    results.append(base_result)
+                    continue
 
                 if signal is None:
                     base_result["skipped_reason"] = "signal_failed"
                     results.append(base_result)
                     continue
 
+                # Fill Agent 2 fields.
+                base_result["signal_direction"] = signal.direction
+                base_result["signal_confidence"] = signal.confidence
+                base_result["strategy_tag"] = signal.strategy_tag
+                base_result["signal_raw_logits"] = str(signal.raw_signal_logits)
+                base_result["signal_logits"] = str(signal.signal_logits)
+                base_result["signal_probabilities"] = str(signal.signal_probabilities)
+                base_result["signal_filter_forced_hold"] = signal.signal_filter_forced_hold
+                base_result["signal_filter_reason"] = signal.signal_filter_reason
+
                 realized_return = get_realized_return(
                     ticker=row["ticker"],
                     start_date=row["start_date"],
                     end_date=row["end_date"],
                 )
-
-                base_result["signal_direction"] = signal.direction
-                base_result["signal_confidence"] = signal.confidence
-                base_result["signal_strategy_tag"] = signal.strategy_tag
-                base_result["signal_logits"] = str(signal.signal_logits)
-                base_result["signal_probabilities"] = str(signal.signal_probabilities)
 
                 if realized_return is None:
                     base_result["skipped_reason"] = "price_fetch_failed"
@@ -187,6 +263,14 @@ def run_backtest(
 def compute_metrics(results: pd.DataFrame) -> dict:
     """
     Compute backtest summary metrics over successful rows only.
+
+    Successful rows are those where skipped_reason == "".
+    Extended metrics include:
+      - trade counts (long / short / neutral)
+      - coverage / abstention rate
+      - max drawdown
+      - long/short precision
+      - per-event_type grouped returns (if event_type column is present)
     """
     total_rows = int(len(results))
     successful = results[results["skipped_reason"] == ""].copy()
@@ -194,20 +278,34 @@ def compute_metrics(results: pd.DataFrame) -> dict:
     skipped = total_rows - successful_rows
     skip_rate = (skipped / total_rows) if total_rows else 0.0
 
-    metrics = {
+    metrics: dict = {
         "total_rows": total_rows,
         "successful_rows": successful_rows,
         "skip_rate": skip_rate,
-        "direction_accuracy": 0.0,
-        "long_accuracy": 0.0,
-        "short_accuracy": 0.0,
-        "mean_strategy_return": 0.0,
-        "std_strategy_return": 0.0,
-        "annualized_sharpe": 0.0,
-        "total_pnl": 0.0,
-        "vs_fingpt_accuracy": 0.0,
     }
+
     if successful_rows == 0:
+        metrics.update({
+            "direction_accuracy": 0.0,
+            "long_accuracy": 0.0,
+            "short_accuracy": 0.0,
+            "mean_strategy_return": 0.0,
+            "std_strategy_return": 0.0,
+            "annualized_sharpe": 0.0,
+            "total_pnl": 0.0,
+            "gross_return": 0.0,
+            "max_drawdown": 0.0,
+            "vs_fingpt_accuracy": 0.0,
+            "long_trade_count": 0,
+            "short_trade_count": 0,
+            "neutral_count": 0,
+            "num_trades": 0,
+            "coverage": 0.0,
+            "abstention_rate": 0.0,
+            "long_precision": 0.0,
+            "short_precision": 0.0,
+            "signal_filter_forced_hold_rate": 0.0,
+        })
         return metrics
 
     successful["realized_direction"] = successful["realized_return"].astype(float).apply(
@@ -222,32 +320,91 @@ def compute_metrics(results: pd.DataFrame) -> dict:
     metrics["direction_accuracy"] = float(successful["is_direction_correct"].mean())
 
     long_rows = successful[successful["signal_direction"] == "long"]
+    short_rows = successful[successful["signal_direction"] == "short"]
+    neutral_rows = successful[successful["signal_direction"] == "neutral"]
+
+    long_count = int(len(long_rows))
+    short_count = int(len(short_rows))
+    neutral_count = int(len(neutral_rows))
+
+    metrics["long_trade_count"] = long_count
+    metrics["short_trade_count"] = short_count
+    metrics["neutral_count"] = neutral_count
+    metrics["num_trades"] = long_count + short_count
+    metrics["coverage"] = (long_count + short_count) / successful_rows if successful_rows else 0.0
+    metrics["abstention_rate"] = neutral_count / successful_rows if successful_rows else 0.0
+
     if not long_rows.empty:
         metrics["long_accuracy"] = float(
             (long_rows["realized_direction"] == "up").mean()
         )
+        metrics["long_precision"] = metrics["long_accuracy"]
+    else:
+        metrics["long_accuracy"] = 0.0
+        metrics["long_precision"] = 0.0
 
-    short_rows = successful[successful["signal_direction"] == "short"]
     if not short_rows.empty:
         metrics["short_accuracy"] = float(
             (short_rows["realized_direction"] == "down").mean()
         )
+        metrics["short_precision"] = metrics["short_accuracy"]
+    else:
+        metrics["short_accuracy"] = 0.0
+        metrics["short_precision"] = 0.0
 
     strategy_returns = successful["strategy_return"].astype(float)
     mean_return = float(strategy_returns.mean())
     std_return = float(strategy_returns.std(ddof=0))
+    total_pnl = float(strategy_returns.sum())
+
     metrics["mean_strategy_return"] = mean_return
     metrics["std_strategy_return"] = std_return
-    metrics["total_pnl"] = float(strategy_returns.sum())
+    metrics["total_pnl"] = total_pnl
+    metrics["gross_return"] = total_pnl  # alias for clarity
+
     if std_return > 0:
         metrics["annualized_sharpe"] = float((mean_return / std_return) * math.sqrt(52.0))
+    else:
+        metrics["annualized_sharpe"] = 0.0
 
-    successful["fingpt_direction"] = successful["fingpt_label"].map(
-        {"up": "long", "down": "short", "neutral": "neutral"}
-    )
-    metrics["vs_fingpt_accuracy"] = float(
-        (successful["signal_direction"] == successful["fingpt_direction"]).mean()
-    )
+    # Max drawdown from cumulative return sequence.
+    cum_returns = strategy_returns.cumsum()
+    running_max = cum_returns.cummax()
+    drawdowns = running_max - cum_returns
+    metrics["max_drawdown"] = float(drawdowns.max()) if not drawdowns.empty else 0.0
+
+    # Alignment with FinGPT reference labels.
+    if "fingpt_label" in successful.columns and "signal_direction" in successful.columns:
+        successful_fgt = successful.copy()
+        successful_fgt["fingpt_direction"] = successful_fgt["fingpt_label"].map(
+            {"up": "long", "down": "short", "neutral": "neutral"}
+        )
+        metrics["vs_fingpt_accuracy"] = float(
+            (successful_fgt["signal_direction"] == successful_fgt["fingpt_direction"]).mean()
+        )
+    else:
+        metrics["vs_fingpt_accuracy"] = 0.0
+
+    # Signal filter forced-hold rate.
+    if "signal_filter_forced_hold" in successful.columns:
+        forced = successful["signal_filter_forced_hold"].astype(bool)
+        metrics["signal_filter_forced_hold_rate"] = float(forced.mean())
+    else:
+        metrics["signal_filter_forced_hold_rate"] = 0.0
+
+    # Per-event_type grouped returns (if column present).
+    if "event_type" in successful.columns:
+        grouped = (
+            successful.groupby("event_type")["strategy_return"]
+            .agg(["mean", "count"])
+            .rename(columns={"mean": "mean_return", "count": "n_rows"})
+        )
+        event_breakdown: dict = {}
+        for et, row in grouped.iterrows():
+            event_breakdown[str(et)] = {
+                "mean_return": round(float(row["mean_return"]), 6),
+                "n_rows": int(row["n_rows"]),
+            }
+        metrics["event_type_breakdown"] = event_breakdown
 
     return metrics
-

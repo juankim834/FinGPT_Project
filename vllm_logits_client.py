@@ -246,62 +246,77 @@ def get_real_choice_logits(
     decision_prefix: str,
     tokenizer: Any,
     max_cot_tokens: int = 900,
+    use_cot: bool = False,
 ) -> dict[str, Any]:
     """
-    Extract **real** model log-probabilities for each choice using two vLLM
-    calls (single-article path).
+    Extract **real** model log-probabilities for each choice using vLLM
+    prompt_logprobs (single-article path).
 
     Parameters
     ----------
     engine:
         Shared vLLM ``LLM`` instance.
     cot_prompt:
-        Fully-formatted prompt (chat template already applied) that instructs
-        the model to write its CoT reasoning inside ``<think>…</think>``.
+        Fully-formatted prompt (chat template already applied).  When
+        ``use_cot=True`` this should instruct the model to write its reasoning
+        inside ``<think>…</think>``.  When ``use_cot=False`` the prompt is
+        used directly as the scoring context (Phase 1 is skipped).
     choices:
         Ordered list of class labels, e.g. ``["POSITIVE","NEGATIVE","NEUTRAL"]``.
     decision_prefix:
-        Short string appended after ``</think>\\n`` that sets up the decision
-        context, e.g. ``"Sentiment: "``.  The model's next-token distribution
-        at this point is what we score.
+        Short string appended after ``</think>\\n`` (CoT mode) or directly
+        after the prompt (no-CoT mode) to set up the decision context, e.g.
+        ``"Sentiment: "``.  The model's next-token distribution at this point
+        is what we score.
     tokenizer:
         HuggingFace tokenizer for the model (same as vLLM uses internally).
         Required to resolve choice token IDs and compute ``context_len``.
     max_cot_tokens:
-        Token budget for the CoT generation phase (Phase 1).
+        Token budget for the CoT generation phase (Phase 1).  Ignored when
+        ``use_cot=False``.
+    use_cot:
+        When True (default), run Phase 1 CoT generation then score.
+        When False, skip Phase 1 and score directly against
+        ``cot_prompt + decision_prefix``.  The ``thinking`` field in the
+        result will be an empty string.
 
     Returns
     -------
     dict with keys:
-        ``logits``        – ``list[float]``: real log P(choice_i | ctx) values,
+        ``logits``        - ``list[float]``: real log P(choice_i | ctx) values,
                             aligned with *choices*.
-        ``choices``       – same as input.
-        ``raw_output``    – CoT text generated in Phase 1.
-        ``thinking``      – extracted chain-of-thought reasoning.
-        ``parse_success`` – True when all choice tokens were found in the
+        ``choices``       - same as input.
+        ``raw_output``    - CoT text generated in Phase 1 (empty when no-CoT).
+        ``thinking``      - extracted chain-of-thought reasoning (empty when no-CoT).
+        ``parse_success`` - True when all choice tokens were found in the
                             prompt_logprobs dict.
 
-    Two vLLM calls are made:
-        Phase 1: one generation call (CoT, stop at </think>).
+    vLLM calls made:
+        Phase 1 (CoT mode only): one generation call (stop at </think>).
         Phase 2: K scoring calls batched into one engine.generate() call,
                  where K = len(choices).
     """
     from vllm import SamplingParams  # type: ignore
 
-    # ── Phase 1: CoT generation ───────────────────────────────────────────────
-    cot_params = SamplingParams(
-        max_tokens=max_cot_tokens,
-        temperature=0.0,
-        stop=["</think>"],
-    )
-    cot_outputs = engine.generate([cot_prompt], cot_params)
-    cot_text: str = (
-        cot_outputs[0].outputs[0].text if cot_outputs[0].outputs else ""
-    )
-    thinking = extract_thinking(cot_text + "</think>")
+    # ── Phase 1: CoT generation (skipped in no-CoT mode) ─────────────────────
+    if use_cot:
+        cot_params = SamplingParams(
+            max_tokens=max_cot_tokens,
+            temperature=0.0,
+            stop=["</think>"],
+        )
+        cot_outputs = engine.generate([cot_prompt], cot_params)
+        cot_text: str = (
+            cot_outputs[0].outputs[0].text if cot_outputs[0].outputs else ""
+        )
+        thinking = extract_thinking(cot_text + "</think>")
+        scoring_context = cot_prompt + cot_text + "</think>\n" + decision_prefix
+    else:
+        cot_text = ""
+        thinking = ""
+        scoring_context = cot_prompt + decision_prefix
 
     # ── Phase 2: Scoring via prompt_logprobs ──────────────────────────────────
-    scoring_context = cot_prompt + cot_text + "</think>\n" + decision_prefix
 
     scoring_prompts = [scoring_context + choice for choice in choices]
     score_params = SamplingParams(
@@ -347,14 +362,24 @@ def get_real_choice_logits_batch(
     decision_prefix: str,
     tokenizer: Any,
     max_cot_tokens: int = 900,
+    use_cot: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Batch version of ``get_real_choice_logits``.
 
-    Makes exactly **two** ``engine.generate()`` calls regardless of batch size:
+    Makes at most **two** ``engine.generate()`` calls regardless of batch size:
 
     Phase 1  — N CoT generations (one per article) in a single call.
-    Phase 2  — N × K scoring prompts in a single call, where K = len(choices).
+               Skipped when ``use_cot=False``.
+    Phase 2  — N x K scoring prompts in a single call, where K = len(choices).
+
+    Parameters
+    ----------
+    use_cot:
+        When True (default), run Phase 1 CoT generation then score.
+        When False, skip Phase 1 and score directly against each
+        ``cot_prompt + decision_prefix``.  The ``thinking`` field in each
+        result will be an empty string.
 
     Each item in the returned list has the same schema as
     ``get_real_choice_logits``.  Output logic (softmax, argmax, signal
@@ -368,22 +393,28 @@ def get_real_choice_logits_batch(
     n = len(cot_prompts)
     k = len(choices)
 
-    # ── Phase 1: Batch CoT generation ────────────────────────────────────────
-    cot_params = SamplingParams(
-        max_tokens=max_cot_tokens,
-        temperature=0.0,
-        stop=["</think>"],
-    )
-    cot_outputs = engine.generate(cot_prompts, cot_params)
-    cot_texts: list[str] = [
-        o.outputs[0].text if o.outputs else "" for o in cot_outputs
-    ]
+    # ── Phase 1: Batch CoT generation (skipped in no-CoT mode) ───────────────
+    if use_cot:
+        cot_params = SamplingParams(
+            max_tokens=max_cot_tokens,
+            temperature=0.0,
+            stop=["</think>"],
+        )
+        cot_outputs = engine.generate(cot_prompts, cot_params)
+        cot_texts: list[str] = [
+            o.outputs[0].text if o.outputs else "" for o in cot_outputs
+        ]
+    else:
+        cot_texts = [""] * n
 
     # Build scoring contexts and prompts: N × K
     scoring_contexts: list[str] = []
     scoring_prompts: list[str] = []
     for i in range(n):
-        ctx = cot_prompts[i] + cot_texts[i] + "</think>\n" + decision_prefix
+        if use_cot:
+            ctx = cot_prompts[i] + cot_texts[i] + "</think>\n" + decision_prefix
+        else:
+            ctx = cot_prompts[i] + decision_prefix
         scoring_contexts.append(ctx)
         for choice in choices:
             scoring_prompts.append(ctx + choice)
@@ -423,11 +454,13 @@ def get_real_choice_logits_batch(
             i, article_logprobs, choices,
         )
 
+        raw_output = cot_texts[i]
+        thinking = extract_thinking(raw_output + "</think>") if use_cot else ""
         results.append({
             "logits": article_logprobs,
             "choices": choices,
-            "raw_output": cot_texts[i],
-            "thinking": extract_thinking(cot_texts[i] + "</think>"),
+            "raw_output": raw_output,
+            "thinking": thinking,
             "parse_success": all_found,
         })
 
