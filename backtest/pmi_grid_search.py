@@ -559,6 +559,347 @@ def run_alpha_confidence_grid_search(
     return summary
 
 
+def _empty_summary_row(
+    *,
+    pmi_alpha: float,
+    calibration_t: float,
+    min_confidence: float,
+    min_margin: float,
+    buy_threshold: float,
+    sell_threshold: float,
+    strategy_mode: str,
+    raw_rows: int,
+    signal_rows: int,
+) -> dict[str, object]:
+    return {
+        "pmi_alpha": pmi_alpha,
+        "calibration_T": calibration_t,
+        "signal_min_confidence": min_confidence,
+        "signal_min_margin": min_margin,
+        "buy_threshold": buy_threshold,
+        "sell_threshold": sell_threshold,
+        "strategy_mode": strategy_mode,
+        "raw_rows": raw_rows,
+        "signal_rows": signal_rows,
+    }
+
+
+def _finalize_summary(summary: pd.DataFrame) -> pd.DataFrame:
+    if not summary.empty:
+        summary["rank_total_pnl"] = summary["total_pnl"].rank(
+            method="dense", ascending=False
+        )
+        summary["rank_sharpe"] = summary["annualized_sharpe"].rank(
+            method="dense", ascending=False
+        )
+        summary["rank_direction_accuracy"] = summary["direction_accuracy"].rank(
+            method="dense", ascending=False
+        )
+    return summary
+
+
+def _compute_signal_rows(adjusted: pd.DataFrame) -> pd.DataFrame:
+    required = [
+        "raw_signal_logprob_A",
+        "raw_signal_logprob_B",
+        "raw_signal_logprob_C",
+    ]
+    raw_signal_mask = adjusted[required].notna().all(axis=1)
+    return adjusted.loc[raw_signal_mask].copy()
+
+
+def apply_long_only_grid_strategy(
+    results: pd.DataFrame,
+    *,
+    pmi_alpha: float,
+    confidence_threshold: float,
+    margin_threshold: float,
+    calibration_t: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Apply the user's long-only rule with PMI-corrected logits:
+
+      adjusted_logit = raw_logit - alpha * null_logit
+      prob = softmax(adjusted_logit)
+      buy_margin = prob_buy - max(prob_hold, prob_sell)
+      if prob_buy >= confidence_threshold and buy_margin >= margin_threshold:
+          position = 1
+      else:
+          position = 0
+    """
+    adjusted = results.copy()
+
+    for column in [
+        "pmi_adjusted_logit_A",
+        "pmi_adjusted_logit_B",
+        "pmi_adjusted_logit_C",
+        "signal_prob_A",
+        "signal_prob_B",
+        "signal_prob_C",
+        "direction",
+        "confidence",
+        "signal_direction",
+        "signal_confidence",
+        "signal_filter_forced_hold",
+        "signal_filter_reason",
+        "pmi_alpha_used",
+    ]:
+        if column not in adjusted.columns:
+            adjusted[column] = math.nan if "prob_" in column or "confidence" in column else ""
+    if "position" not in adjusted.columns:
+        adjusted["position"] = math.nan
+    if "strategy_return" not in adjusted.columns:
+        adjusted["strategy_return"] = math.nan
+    if "skipped_reason" not in adjusted.columns:
+        adjusted["skipped_reason"] = ""
+
+    adjusted["skipped_reason"] = adjusted["skipped_reason"].apply(_normalize_skipped_reason)
+
+    for idx in adjusted.index:
+        row = adjusted.loc[idx]
+        raw_logits = _extract_triplet(row, "raw_signal_logprob")
+        if raw_logits is None:
+            continue
+        null_logprobs = _extract_triplet(row, "pmi_null_logprob")
+        adjusted_logits = list(raw_logits)
+        if null_logprobs is not None and len(null_logprobs) == len(raw_logits):
+            adjusted_logits = [
+                raw - pmi_alpha * null_lp
+                for raw, null_lp in zip(raw_logits, null_logprobs)
+            ]
+
+        probs = softmax(adjusted_logits, temperature=calibration_t)
+        prob_buy, prob_hold, prob_sell = probs
+        buy_margin = prob_buy - max(prob_hold, prob_sell)
+        take_long = (
+            prob_buy >= confidence_threshold
+            and buy_margin >= margin_threshold
+        )
+
+        direction = "long" if take_long else "neutral"
+        confidence = prob_buy if take_long else max(prob_hold, prob_sell, prob_buy)
+        filter_reason = "" if take_long else "long_only_filter"
+
+        adjusted.at[idx, "pmi_adjusted_logit_A"] = adjusted_logits[0]
+        adjusted.at[idx, "pmi_adjusted_logit_B"] = adjusted_logits[1]
+        adjusted.at[idx, "pmi_adjusted_logit_C"] = adjusted_logits[2]
+        adjusted.at[idx, "signal_prob_A"] = prob_buy
+        adjusted.at[idx, "signal_prob_B"] = prob_hold
+        adjusted.at[idx, "signal_prob_C"] = prob_sell
+        adjusted.at[idx, "direction"] = direction
+        adjusted.at[idx, "confidence"] = confidence
+        adjusted.at[idx, "signal_direction"] = direction
+        adjusted.at[idx, "signal_confidence"] = confidence
+        adjusted.at[idx, "signal_filter_forced_hold"] = not take_long
+        adjusted.at[idx, "signal_filter_reason"] = filter_reason
+        adjusted.at[idx, "pmi_alpha_used"] = pmi_alpha
+
+        realized_return = _coerce_float(row.get("realized_return"))
+        if realized_return is None:
+            continue
+
+        position = 1 if take_long else 0
+        adjusted.at[idx, "position"] = position
+        adjusted.at[idx, "strategy_return"] = position * realized_return
+        skipped_reason = _normalize_skipped_reason(row.get("skipped_reason", ""))
+        if skipped_reason == "price_fetch_failed":
+            continue
+        if skipped_reason in {"", "signal_failed"}:
+            adjusted.at[idx, "skipped_reason"] = ""
+
+    return adjusted
+
+
+def run_alpha_confidence_margin_grid_search(
+    results_or_path: pd.DataFrame | str,
+    *,
+    alphas: list[float],
+    confidence_levels: list[float],
+    margin_levels: list[float],
+    output_path: Optional[str] = None,
+    detailed_output_dir: Optional[str] = None,
+    calibration_t: float = CALIBRATION_T,
+    buy_threshold: float = FINGPT_BUY_THRESHOLD,
+    sell_threshold: float = FINGPT_SELL_THRESHOLD,
+) -> pd.DataFrame:
+    """
+    Three-dimensional grid search for the mixed long/neutral/short strategy.
+    """
+    if isinstance(results_or_path, pd.DataFrame):
+        base_results = results_or_path.copy()
+    else:
+        base_results = pd.read_csv(results_or_path)
+
+    summary_rows: list[dict[str, object]] = []
+    original_direction = (
+        base_results["signal_direction"].astype(str)
+        if "signal_direction" in base_results.columns
+        else pd.Series([""] * len(base_results), index=base_results.index)
+    )
+
+    for alpha in alphas:
+        for min_confidence in confidence_levels:
+            for min_margin in margin_levels:
+                adjusted = apply_pmi_alpha_to_results(
+                    base_results,
+                    pmi_alpha=alpha,
+                    calibration_t=calibration_t,
+                    min_confidence=min_confidence,
+                    min_margin=min_margin,
+                    buy_threshold=buy_threshold,
+                    sell_threshold=sell_threshold,
+                )
+                metrics = compute_metrics(adjusted)
+                signal_rows = _compute_signal_rows(adjusted)
+                signal_direction = signal_rows["signal_direction"].astype(str)
+                forced_hold_series = signal_rows.get(
+                    "signal_filter_forced_hold",
+                    pd.Series(False, index=signal_rows.index, dtype=bool),
+                ).astype(bool)
+
+                summary_row = _empty_summary_row(
+                    pmi_alpha=alpha,
+                    calibration_t=calibration_t,
+                    min_confidence=min_confidence,
+                    min_margin=min_margin,
+                    buy_threshold=buy_threshold,
+                    sell_threshold=sell_threshold,
+                    strategy_mode="mixed",
+                    raw_rows=int(len(base_results)),
+                    signal_rows=int(len(signal_rows)),
+                )
+                summary_row.update({
+                    "signal_long_count": int((signal_direction == "long").sum()),
+                    "signal_short_count": int((signal_direction == "short").sum()),
+                    "signal_neutral_count": int((signal_direction == "neutral").sum()),
+                    "signal_changed_count": int(
+                        (
+                            signal_rows["signal_direction"].astype(str)
+                            != original_direction.loc[signal_rows.index]
+                        ).sum()
+                    ),
+                    "forced_hold_count": int(forced_hold_series.sum()),
+                })
+                summary_row["signal_changed_rate"] = (
+                    summary_row["signal_changed_count"] / summary_row["signal_rows"]
+                    if summary_row["signal_rows"]
+                    else 0.0
+                )
+                summary_row["forced_hold_rate"] = (
+                    summary_row["forced_hold_count"] / summary_row["signal_rows"]
+                    if summary_row["signal_rows"]
+                    else 0.0
+                )
+                summary_row.update(metrics)
+                summary_rows.append(summary_row)
+
+                if detailed_output_dir:
+                    os.makedirs(detailed_output_dir, exist_ok=True)
+                    alpha_slug = str(alpha).replace("-", "neg_").replace(".", "_")
+                    conf_slug = str(min_confidence).replace("-", "neg_").replace(".", "_")
+                    margin_slug = str(min_margin).replace("-", "neg_").replace(".", "_")
+                    adjusted.to_csv(
+                        os.path.join(
+                            detailed_output_dir,
+                            f"backtest_mixed_alpha_{alpha_slug}_confidence_{conf_slug}_margin_{margin_slug}.csv",
+                        ),
+                        index=False,
+                    )
+
+    summary = _finalize_summary(pd.DataFrame(summary_rows))
+    if output_path:
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        summary.to_csv(output_path, index=False)
+    return summary
+
+
+def run_long_only_grid_search(
+    results_or_path: pd.DataFrame | str,
+    *,
+    alphas: list[float],
+    confidence_levels: list[float],
+    margin_levels: list[float],
+    output_path: Optional[str] = None,
+    detailed_output_dir: Optional[str] = None,
+    calibration_t: float = CALIBRATION_T,
+) -> pd.DataFrame:
+    """
+    Three-dimensional grid search for the user's long-only rule.
+    """
+    if isinstance(results_or_path, pd.DataFrame):
+        base_results = results_or_path.copy()
+    else:
+        base_results = pd.read_csv(results_or_path)
+
+    summary_rows: list[dict[str, object]] = []
+
+    for alpha in alphas:
+        for confidence_threshold in confidence_levels:
+            for margin_threshold in margin_levels:
+                adjusted = apply_long_only_grid_strategy(
+                    base_results,
+                    pmi_alpha=alpha,
+                    confidence_threshold=confidence_threshold,
+                    margin_threshold=margin_threshold,
+                    calibration_t=calibration_t,
+                )
+                metrics = compute_metrics(adjusted)
+                signal_rows = _compute_signal_rows(adjusted)
+                signal_direction = signal_rows["signal_direction"].astype(str)
+                long_entries = int((signal_direction == "long").sum())
+
+                summary_row = _empty_summary_row(
+                    pmi_alpha=alpha,
+                    calibration_t=calibration_t,
+                    min_confidence=confidence_threshold,
+                    min_margin=margin_threshold,
+                    buy_threshold=confidence_threshold,
+                    sell_threshold=1.0,
+                    strategy_mode="long_only",
+                    raw_rows=int(len(base_results)),
+                    signal_rows=int(len(signal_rows)),
+                )
+                summary_row.update({
+                    "signal_long_count": long_entries,
+                    "signal_short_count": 0,
+                    "signal_neutral_count": int((signal_direction == "neutral").sum()),
+                    "signal_changed_count": 0,
+                    "forced_hold_count": int((signal_direction != "long").sum()),
+                    "long_entry_rate": (long_entries / len(signal_rows)) if len(signal_rows) else 0.0,
+                })
+                summary_row["signal_changed_rate"] = 0.0
+                summary_row["forced_hold_rate"] = (
+                    summary_row["forced_hold_count"] / summary_row["signal_rows"]
+                    if summary_row["signal_rows"]
+                    else 0.0
+                )
+                summary_row.update(metrics)
+                summary_rows.append(summary_row)
+
+                if detailed_output_dir:
+                    os.makedirs(detailed_output_dir, exist_ok=True)
+                    alpha_slug = str(alpha).replace("-", "neg_").replace(".", "_")
+                    conf_slug = str(confidence_threshold).replace("-", "neg_").replace(".", "_")
+                    margin_slug = str(margin_threshold).replace("-", "neg_").replace(".", "_")
+                    adjusted.to_csv(
+                        os.path.join(
+                            detailed_output_dir,
+                            f"backtest_long_only_alpha_{alpha_slug}_confidence_{conf_slug}_margin_{margin_slug}.csv",
+                        ),
+                        index=False,
+                    )
+
+    summary = _finalize_summary(pd.DataFrame(summary_rows))
+    if output_path:
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        summary.to_csv(output_path, index=False)
+    return summary
+
+
 def parse_alpha_grid(alpha_spec: str) -> list[float]:
     """
     Parse a comma-separated alpha list like ``"0,0.25,0.5,1.0"``.

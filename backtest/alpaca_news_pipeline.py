@@ -22,7 +22,7 @@ from typing import Any, Optional
 import pandas as pd
 import requests
 
-from backtest.backtester import run_backtest
+from backtest.backtester import run_backtest, save_backtest_metrics_json
 from config import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_NEWS_URL, LOG_LEVEL
 
 logging.basicConfig(level=LOG_LEVEL)
@@ -668,5 +668,10 @@ def run_alpaca_backtest_pipeline(
             batch_size=config.batch_size,
         )
         result["backtest_rows"] = int(len(backtest_df))
+        metrics_path = str(Path(config.backtest_output_path).with_name(
+            Path(config.backtest_output_path).stem + "_metrics.json"
+        ))
+        save_backtest_metrics_json(backtest_df, metrics_path)
+        result["backtest_metrics_path"] = metrics_path
 
     return result

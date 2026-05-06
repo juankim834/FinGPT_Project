@@ -4,7 +4,12 @@ import pandas as pd
 
 from agent1.schema import NewsFingerprint
 from agent2.schema import TradingSignal
-from backtest.backtester import compute_metrics, flatten_article_result
+from backtest.backtester import (
+    augment_metrics_with_demo_fields,
+    compute_metrics,
+    flatten_article_result,
+    get_demo_column_groups,
+)
 from backtest.dataset_parser import extract_article_text
 
 
@@ -221,3 +226,64 @@ def test_extract_article_text_preserves_ticker_context():
 
     assert article_text.startswith("Ticker: AAPL")
     assert "Headline: Apple launches a new product" in article_text
+
+
+def test_demo_helpers_match_expected_columns_and_metrics():
+    results = pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "fingerprint_ticker": "AAPL",
+                "signal_ticker": "AAPL",
+                "fingpt_label": "up",
+                "sentiment_label": "POSITIVE",
+                "sentiment_confidence": 0.8,
+                "sentiment_logprob_POSITIVE": -0.2,
+                "sentiment_logprob_NEGATIVE": -2.0,
+                "sentiment_logprob_NEUTRAL": -2.1,
+                "sentiment_prob_POSITIVE": 0.8,
+                "sentiment_prob_NEGATIVE": 0.1,
+                "sentiment_prob_NEUTRAL": 0.1,
+                "event_type": "EARNINGS",
+                "event_type_confidence": 0.7,
+                "event_type_margin": 0.4,
+                "event_type_method": "logits_accepted",
+                "event_logprob_A": -0.1,
+                "event_prob_A": 0.7,
+                "direction": "long",
+                "confidence": 0.71,
+                "raw_signal_logprob_A": -0.3,
+                "raw_signal_logprob_B": -1.0,
+                "raw_signal_logprob_C": -2.0,
+                "pmi_null_logprob_A": -1.2,
+                "pmi_null_logprob_B": -1.1,
+                "pmi_null_logprob_C": -1.3,
+                "pmi_adjusted_logit_A": 0.42,
+                "pmi_adjusted_logit_B": -0.34,
+                "pmi_adjusted_logit_C": -1.22,
+                "signal_prob_A": 0.71,
+                "signal_prob_B": 0.2,
+                "signal_prob_C": 0.09,
+                "pmi_alpha_used": 0.6,
+                "calibration_T": 1.3,
+                "signal_filter_forced_hold": False,
+                "signal_filter_reason": "",
+                "realized_return": 0.05,
+                "strategy_return": 0.05,
+                "signal_direction": "long",
+                "skipped_reason": "",
+            }
+        ]
+    )
+
+    groups = get_demo_column_groups(results)
+    metrics = augment_metrics_with_demo_fields(results, compute_metrics(results))
+
+    assert "sentiment_confidence" in groups["sentiment"]
+    assert "event_type_method" in groups["event_type"]
+    assert "pmi_adjusted_logit_A" in groups["signal"]
+    assert "signal_prob_C" in groups["sample"]
+    assert metrics["avg_sentiment_confidence"] == 0.8
+    assert metrics["avg_signal_confidence"] == 0.71
+    assert metrics["avg_pmi_alpha_used"] == 0.6
+    assert metrics["avg_calibration_T"] == 1.3

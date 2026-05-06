@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import json
 from typing import Optional
 
 import pandas as pd
@@ -632,4 +633,152 @@ def compute_metrics(results: pd.DataFrame) -> dict:
             }
         metrics["event_type_breakdown"] = event_breakdown
 
+    return metrics
+
+
+def augment_metrics_with_demo_fields(results: pd.DataFrame, metrics: Optional[dict] = None) -> dict:
+    """
+    Add the extra summary fields shown in demo.ipynb so other entrypoints can
+    report/save the same model-level metrics.
+    """
+    enriched = dict(metrics or compute_metrics(results))
+
+    if "sentiment_confidence" in results.columns:
+        values = results["sentiment_confidence"].dropna().astype(float)
+        enriched["avg_sentiment_confidence"] = float(values.mean()) if not values.empty else 0.0
+
+    confidence_col = "confidence" if "confidence" in results.columns else "signal_confidence"
+    if confidence_col in results.columns:
+        values = results[confidence_col].dropna().astype(float)
+        enriched["avg_signal_confidence"] = float(values.mean()) if not values.empty else 0.0
+
+    if "pmi_alpha_used" in results.columns:
+        values = results["pmi_alpha_used"].dropna().astype(float)
+        enriched["avg_pmi_alpha_used"] = float(values.mean()) if not values.empty else 0.0
+
+    if "calibration_T" in results.columns:
+        values = results["calibration_T"].dropna().astype(float)
+        enriched["avg_calibration_T"] = float(values.mean()) if not values.empty else 0.0
+
+    return enriched
+
+
+def get_demo_column_groups(results: pd.DataFrame) -> dict[str, list[str]]:
+    """
+    Return the same column groupings used in demo.ipynb for quick inspection of
+    Agent 1 / Agent 2 outputs.
+    """
+    available = set(results.columns)
+
+    def _keep(columns: list[str]) -> list[str]:
+        return [column for column in columns if column in available]
+
+    return {
+        "sentiment": _keep([
+            "ticker",
+            "fingerprint_ticker",
+            "fingpt_label",
+            "sentiment_label",
+            "sentiment_confidence",
+            "sentiment_logprob_POSITIVE",
+            "sentiment_logprob_NEGATIVE",
+            "sentiment_logprob_NEUTRAL",
+            "sentiment_prob_POSITIVE",
+            "sentiment_prob_NEGATIVE",
+            "sentiment_prob_NEUTRAL",
+        ]),
+        "event_type": _keep([
+            "ticker",
+            "fingerprint_ticker",
+            "event_type",
+            "event_type_confidence",
+            "event_type_margin",
+            "event_type_method",
+            "event_logprob_A",
+            "event_logprob_B",
+            "event_logprob_C",
+            "event_logprob_D",
+            "event_logprob_E",
+            "event_logprob_F",
+            "event_logprob_G",
+            "event_prob_A",
+            "event_prob_B",
+            "event_prob_C",
+            "event_prob_D",
+            "event_prob_E",
+            "event_prob_F",
+            "event_prob_G",
+        ]),
+        "signal": _keep([
+            "ticker",
+            "fingerprint_ticker",
+            "signal_ticker",
+            "direction",
+            "confidence",
+            "raw_signal_logprob_A",
+            "raw_signal_logprob_B",
+            "raw_signal_logprob_C",
+            "pmi_null_logprob_A",
+            "pmi_null_logprob_B",
+            "pmi_null_logprob_C",
+            "pmi_adjusted_logit_A",
+            "pmi_adjusted_logit_B",
+            "pmi_adjusted_logit_C",
+            "signal_prob_A",
+            "signal_prob_B",
+            "signal_prob_C",
+            "signal_filter_forced_hold",
+            "signal_filter_reason",
+            "realized_return",
+            "strategy_return",
+            "skipped_reason",
+        ]),
+        "sample": _keep([
+            "ticker",
+            "sentiment_label",
+            "sentiment_confidence",
+            "sentiment_logprob_POSITIVE",
+            "sentiment_logprob_NEGATIVE",
+            "sentiment_logprob_NEUTRAL",
+            "event_type",
+            "event_type_confidence",
+            "event_type_margin",
+            "event_logprob_A",
+            "event_logprob_B",
+            "event_logprob_C",
+            "event_logprob_D",
+            "event_logprob_E",
+            "event_logprob_F",
+            "event_logprob_G",
+            "direction",
+            "confidence",
+            "raw_signal_logprob_A",
+            "raw_signal_logprob_B",
+            "raw_signal_logprob_C",
+            "pmi_null_logprob_A",
+            "pmi_null_logprob_B",
+            "pmi_null_logprob_C",
+            "pmi_adjusted_logit_A",
+            "pmi_adjusted_logit_B",
+            "pmi_adjusted_logit_C",
+            "signal_prob_A",
+            "signal_prob_B",
+            "signal_prob_C",
+            "pmi_alpha_used",
+            "calibration_T",
+        ]),
+    }
+
+
+def save_backtest_metrics_json(results: pd.DataFrame, output_path: str) -> dict:
+    """
+    Persist demo-aligned backtest metrics to JSON and return the payload.
+    """
+    metrics = augment_metrics_with_demo_fields(results)
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(metrics, fh, indent=2, default=str)
+    logger.info("Saved backtest metrics to %s", output_path)
     return metrics

@@ -3,10 +3,13 @@ import math
 import pandas as pd
 
 from backtest.pmi_grid_search import (
+    apply_long_only_grid_strategy,
     apply_pmi_alpha_to_results,
     parse_alpha_grid,
     parse_confidence_grid,
+    run_alpha_confidence_margin_grid_search,
     run_alpha_confidence_grid_search,
+    run_long_only_grid_search,
     run_pmi_alpha_grid_search,
     run_signal_confidence_grid_search,
 )
@@ -118,3 +121,44 @@ def test_run_alpha_confidence_grid_search_returns_all_combinations():
     assert set(summary["signal_min_confidence"]) == {0.0, 0.8}
     assert "forced_hold_count" in summary.columns
     assert "rank_total_pnl" in summary.columns
+
+
+def test_run_alpha_confidence_margin_grid_search_returns_cartesian_product():
+    summary = run_alpha_confidence_margin_grid_search(
+        _base_results(),
+        alphas=[0.0, 1.0],
+        confidence_levels=[0.0, 0.8],
+        margin_levels=[0.0, 0.2],
+        calibration_t=1.0,
+    )
+
+    assert len(summary) == 8
+    assert set(summary["strategy_mode"]) == {"mixed"}
+    assert set(summary["signal_min_margin"]) == {0.0, 0.2}
+
+
+def test_long_only_grid_strategy_only_emits_long_or_neutral():
+    adjusted = apply_long_only_grid_strategy(
+        _base_results(),
+        pmi_alpha=0.0,
+        confidence_threshold=0.0,
+        margin_threshold=0.0,
+        calibration_t=1.0,
+    )
+
+    assert set(adjusted["signal_direction"].dropna().astype(str)) <= {"long", "neutral"}
+    assert set(adjusted["position"].dropna().astype(int)) <= {0, 1}
+
+
+def test_run_long_only_grid_search_returns_cartesian_product():
+    summary = run_long_only_grid_search(
+        _base_results(),
+        alphas=[0.0, 1.0],
+        confidence_levels=[0.0, 0.8],
+        margin_levels=[0.0, 0.2],
+        calibration_t=1.0,
+    )
+
+    assert len(summary) == 8
+    assert set(summary["strategy_mode"]) == {"long_only"}
+    assert set(summary["signal_short_count"]) == {0}
