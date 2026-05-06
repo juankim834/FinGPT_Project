@@ -1,9 +1,12 @@
 import json
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
 from backtest.alpaca_news_pipeline import (
     _config_fingerprint,
+    _next_us_trading_day,
+    _next_or_same_us_trading_day,
     build_alpaca_backtest_dataset,
     load_alpaca_backtest_config,
     load_or_fetch_alpaca_news,
@@ -116,10 +119,20 @@ def test_build_alpaca_backtest_dataset_groups_articles_by_week_and_marks_empty_w
     assert df.iloc[1]["forced_signal"] == "no_signal"
     assert df.iloc[1]["skip_reason"] == "no_article_provided"
     assert df.iloc[1]["pass_reason"] == "no_article_provided"
-    assert "From 2024-01-03 to 2024-01-14" in df.iloc[0]["input"]
+    assert "From 2024-01-08 to 2024-01-16" in df.iloc[0]["input"]
     assert "[Headline]: AI launch" in df.iloc[0]["input"]
     assert "[Headline]: AI follow-up" in df.iloc[0]["input"]
     assert "abcdefghijkl" in df.iloc[0]["input"]
     assert "abcdefghijklm" not in df.iloc[0]["input"]
     assert df.iloc[0]["window_key"] == "2024-01-01__2024-01-07"
     assert df.iloc[1]["window_key"] == "2024-01-08__2024-01-14"
+
+
+def test_next_us_trading_day_skips_weekends_and_mlk_holiday():
+    assert _next_us_trading_day(date(2024, 1, 5)).isoformat() == "2024-01-08"
+    assert _next_us_trading_day(date(2024, 1, 14)).isoformat() == "2024-01-16"
+
+
+def test_next_or_same_us_trading_day_keeps_trading_day_and_skips_holiday():
+    assert _next_or_same_us_trading_day(date(2026, 1, 9)).isoformat() == "2026-01-09"
+    assert _next_or_same_us_trading_day(date(2026, 1, 10)).isoformat() == "2026-01-12"

@@ -5,7 +5,7 @@
   "frequency": "weekly",
   "fetch_articles_per_symbol": 50,
   "combine_articles_per_sample": 5,
-  "holding_period_days": 7,
+  "holding_period_days": 5,
   "sort": "desc",
   "limit_per_request": 50,
   "include_content": false,

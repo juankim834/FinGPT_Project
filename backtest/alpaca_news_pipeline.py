@@ -15,7 +15,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -84,6 +84,85 @@ def _coerce_rfc3339_or_date(value: str) -> datetime:
 
 def _to_rfc3339(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    current = date(year, month, 1)
+    while current.weekday() != weekday:
+        current += timedelta(days=1)
+    return current + timedelta(weeks=n - 1)
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        current = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        current = date(year, month + 1, 1) - timedelta(days=1)
+    while current.weekday() != weekday:
+        current -= timedelta(days=1)
+    return current
+
+
+def _easter_sunday(year: int) -> date:
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _observed_market_holiday(day: date) -> date:
+    if day.weekday() == 5:
+        return day - timedelta(days=1)
+    if day.weekday() == 6:
+        return day + timedelta(days=1)
+    return day
+
+
+def _us_market_holidays(year: int) -> set[date]:
+    holidays = {
+        _observed_market_holiday(date(year, 1, 1)),
+        _nth_weekday_of_month(year, 1, 0, 3),   # MLK Day
+        _nth_weekday_of_month(year, 2, 0, 3),   # Presidents Day
+        _easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _last_weekday_of_month(year, 5, 0),     # Memorial Day
+        _observed_market_holiday(date(year, 6, 19)) if year >= 2022 else None,
+        _observed_market_holiday(date(year, 7, 4)),
+        _nth_weekday_of_month(year, 9, 0, 1),   # Labor Day
+        _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving
+        _observed_market_holiday(date(year, 12, 25)),
+    }
+    return {holiday for holiday in holidays if holiday is not None}
+
+
+def _is_us_trading_day(day: date) -> bool:
+    if day.weekday() >= 5:
+        return False
+    return day not in _us_market_holidays(day.year)
+
+
+def _next_or_same_us_trading_day(day: date) -> date:
+    current = day
+    while not _is_us_trading_day(current):
+        current += timedelta(days=1)
+    return current
+
+
+def _next_us_trading_day(day: date) -> date:
+    current = day + timedelta(days=1)
+    while not _is_us_trading_day(current):
+        current += timedelta(days=1)
+    return current
 
 
 def _load_config_file(config_path: str) -> dict[str, Any]:
@@ -452,10 +531,11 @@ def _articles_to_prompt(
     holding_period_days: int,
     content_max_chars: int,
 ) -> dict[str, Any]:
-    created_at_values = [_coerce_rfc3339_or_date(article["created_at"]) for article in articles]
-    start_dt = min(created_at_values)
-    start_date = start_dt.date().isoformat()
-    end_date = (window_end.date() + timedelta(days=holding_period_days)).isoformat()
+    trading_start = _next_us_trading_day(window_end.date())
+    trading_end_anchor = trading_start + timedelta(days=holding_period_days)
+    trading_end = _next_or_same_us_trading_day(trading_end_anchor)
+    start_date = trading_start.isoformat()
+    end_date = trading_end.isoformat()
 
     segments: list[str] = []
     for article in articles:
