@@ -275,8 +275,8 @@ def get_real_choice_logits(
         Token budget for the CoT generation phase (Phase 1).  Ignored when
         ``use_cot=False``.
     use_cot:
-        When True (default), run Phase 1 CoT generation then score.
-        When False, skip Phase 1 and score directly against
+        When True, run Phase 1 CoT generation then score.
+        When False (default), skip Phase 1 and score directly against
         ``cot_prompt + decision_prefix``.  The ``thinking`` field in the
         result will be an empty string.
 

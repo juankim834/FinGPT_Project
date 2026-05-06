@@ -539,6 +539,8 @@ def _process_signal_result(
         cot=thinking_text,
         signal_logits=adjusted_logits,
         raw_signal_logits=raw_logits,
+        pmi_null_logprobs=list(_null_logprobs) if _null_logprobs is not None else None,
+        pmi_alpha_used=FINGPT_PMI_ALPHA,
         signal_probabilities={k: round(v, 6) for k, v in probabilities.items()},
         calibration_T=CALIBRATION_T,
         signal_filter_forced_hold=forced_hold,

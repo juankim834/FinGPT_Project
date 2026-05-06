@@ -34,41 +34,171 @@ def _position_from_direction(direction: str) -> int:
 
 
 def _make_base_result(row: dict) -> dict:
+    nan = math.nan
     return {
         "ticker": row["ticker"],
         "start_date": row["start_date"],
         "end_date": row["end_date"],
         "article_text": row["article_text"][:120],
         "fingpt_label": row["fingpt_label"],
-        # Agent 1 — sentiment (logits-derived)
         "sentiment_label": None,
-        "sentiment_confidence": None,
-        "sentiment_prob_positive": None,
-        "sentiment_prob_neutral": None,
-        "sentiment_prob_negative": None,
-        # Agent 1 — event type (logits-derived)
+        "sentiment_score": nan,
+        "sentiment_confidence": nan,
+        "sentiment_logprob_POSITIVE": nan,
+        "sentiment_logprob_NEGATIVE": nan,
+        "sentiment_logprob_NEUTRAL": nan,
+        "sentiment_prob_POSITIVE": nan,
+        "sentiment_prob_NEGATIVE": nan,
+        "sentiment_prob_NEUTRAL": nan,
         "event_type": None,
-        "event_type_confidence": None,
-        "event_type_margin": None,
+        "event_type_confidence": nan,
+        "event_type_margin": nan,
         "event_type_method": None,
-        "event_type_probabilities": None,
-        "secondary_event_type": None,
-        "secondary_event_type_confidence": None,
-        # Agent 2 — signal (logits-derived)
-        "signal_direction": None,
-        "signal_confidence": None,
-        "strategy_tag": None,
-        "signal_raw_logits": None,
-        "signal_logits": None,
-        "signal_probabilities": None,
+        "event_logprob_A": nan,
+        "event_logprob_B": nan,
+        "event_logprob_C": nan,
+        "event_logprob_D": nan,
+        "event_logprob_E": nan,
+        "event_logprob_F": nan,
+        "event_logprob_G": nan,
+        "event_prob_A": nan,
+        "event_prob_B": nan,
+        "event_prob_C": nan,
+        "event_prob_D": nan,
+        "event_prob_E": nan,
+        "event_prob_F": nan,
+        "event_prob_G": nan,
+        "direction": None,
+        "confidence": nan,
+        "raw_signal_logprob_A": nan,
+        "raw_signal_logprob_B": nan,
+        "raw_signal_logprob_C": nan,
+        "pmi_null_logprob_A": nan,
+        "pmi_null_logprob_B": nan,
+        "pmi_null_logprob_C": nan,
+        "pmi_adjusted_logit_A": nan,
+        "pmi_adjusted_logit_B": nan,
+        "pmi_adjusted_logit_C": nan,
+        "signal_prob_A": nan,
+        "signal_prob_B": nan,
+        "signal_prob_C": nan,
+        "pmi_alpha_used": nan,
+        "calibration_T": nan,
         "signal_filter_forced_hold": None,
         "signal_filter_reason": None,
-        # Backtest metrics
+        # Legacy aliases preserved for current metrics/downstream code.
+        "signal_direction": None,
+        "signal_confidence": nan,
+        "strategy_tag": None,
         "realized_return": None,
         "position": None,
         "strategy_return": None,
         "skipped_reason": "",
     }
+
+
+def _safe_list_item(values: object, index: int) -> float:
+    if isinstance(values, list) and index < len(values):
+        value = values[index]
+        if isinstance(value, (int, float)):
+            return float(value)
+    return math.nan
+
+
+def _safe_dict_item(values: object, key: str) -> float:
+    if isinstance(values, dict):
+        value = values.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return math.nan
+
+
+def flatten_article_result(
+    row: dict,
+    fingerprint=None,
+    signal=None,
+) -> dict:
+    result = _make_base_result(row)
+
+    if fingerprint is not None:
+        result["sentiment_label"] = fingerprint.sentiment_label
+        result["sentiment_score"] = float(fingerprint.sentiment_score)
+        result["sentiment_confidence"] = float(fingerprint.sentiment_confidence)
+        result["sentiment_logprob_POSITIVE"] = _safe_list_item(
+            fingerprint.sentiment_logits, 0
+        )
+        result["sentiment_logprob_NEGATIVE"] = _safe_list_item(
+            fingerprint.sentiment_logits, 1
+        )
+        result["sentiment_logprob_NEUTRAL"] = _safe_list_item(
+            fingerprint.sentiment_logits, 2
+        )
+        result["sentiment_prob_POSITIVE"] = _safe_dict_item(
+            fingerprint.sentiment_probabilities, "POSITIVE"
+        )
+        result["sentiment_prob_NEGATIVE"] = _safe_dict_item(
+            fingerprint.sentiment_probabilities, "NEGATIVE"
+        )
+        result["sentiment_prob_NEUTRAL"] = _safe_dict_item(
+            fingerprint.sentiment_probabilities, "NEUTRAL"
+        )
+        result["event_type"] = fingerprint.event_type
+        result["event_type_confidence"] = (
+            float(fingerprint.event_type_confidence)
+            if fingerprint.event_type_confidence is not None
+            else math.nan
+        )
+        result["event_type_margin"] = (
+            float(fingerprint.event_type_margin)
+            if fingerprint.event_type_margin is not None
+            else math.nan
+        )
+        result["event_type_method"] = fingerprint.event_type_method
+        for token in ["A", "B", "C", "D", "E", "F", "G"]:
+            result[f"event_logprob_{token}"] = _safe_dict_item(
+                fingerprint.event_type_logits, token
+            )
+            result[f"event_prob_{token}"] = _safe_dict_item(
+                fingerprint.event_type_probabilities, token
+            )
+        result["calibration_T"] = (
+            float(fingerprint.calibration_T)
+            if fingerprint.calibration_T is not None
+            else math.nan
+        )
+
+    if signal is not None:
+        result["direction"] = signal.direction
+        result["confidence"] = float(signal.confidence)
+        result["raw_signal_logprob_A"] = _safe_list_item(signal.raw_signal_logits, 0)
+        result["raw_signal_logprob_B"] = _safe_list_item(signal.raw_signal_logits, 1)
+        result["raw_signal_logprob_C"] = _safe_list_item(signal.raw_signal_logits, 2)
+        result["pmi_null_logprob_A"] = _safe_list_item(signal.pmi_null_logprobs, 0)
+        result["pmi_null_logprob_B"] = _safe_list_item(signal.pmi_null_logprobs, 1)
+        result["pmi_null_logprob_C"] = _safe_list_item(signal.pmi_null_logprobs, 2)
+        result["pmi_adjusted_logit_A"] = _safe_list_item(signal.signal_logits, 0)
+        result["pmi_adjusted_logit_B"] = _safe_list_item(signal.signal_logits, 1)
+        result["pmi_adjusted_logit_C"] = _safe_list_item(signal.signal_logits, 2)
+        result["signal_prob_A"] = _safe_dict_item(signal.signal_probabilities, "BUY")
+        result["signal_prob_B"] = _safe_dict_item(signal.signal_probabilities, "HOLD")
+        result["signal_prob_C"] = _safe_dict_item(signal.signal_probabilities, "SELL")
+        result["pmi_alpha_used"] = (
+            float(signal.pmi_alpha_used)
+            if signal.pmi_alpha_used is not None
+            else math.nan
+        )
+        result["calibration_T"] = (
+            float(signal.calibration_T)
+            if signal.calibration_T is not None
+            else result["calibration_T"]
+        )
+        result["signal_filter_forced_hold"] = signal.signal_filter_forced_hold
+        result["signal_filter_reason"] = signal.signal_filter_reason
+        result["signal_direction"] = signal.direction
+        result["signal_confidence"] = float(signal.confidence)
+        result["strategy_tag"] = signal.strategy_tag
+
+    return result
 
 
 def run_backtest(
@@ -99,13 +229,13 @@ def run_backtest(
         Override FINGPT_BACKTEST_BATCH_SIZE from config.
 
     Strict mode (FINGPT_BACKTEST_STRICT_MODE):
-      - fingerprint_failed       → skip row
-      - event_type_logits_failed → skip row
-      - signal_logits_failed     → skip row
+      - fingerprint_failed       -> skip row
+      - event_type_logits_failed -> skip row
+      - signal_logits_failed     -> skip row
     Non-strict mode:
-      - fingerprint_failed → skip row (always — no fingerprint, no signal)
-      - event_type_logits_failed → keep row with event_type=OTHER
-      - signal_logits_failed → skip row
+      - fingerprint_failed -> skip row (always - no fingerprint, no signal)
+      - event_type_logits_failed -> keep row with event_type=OTHER
+      - signal_logits_failed -> skip row
     """
     effective_batch_size = batch_size if batch_size is not None else FINGPT_BACKTEST_BATCH_SIZE
 
@@ -121,12 +251,11 @@ def run_backtest(
         batch = rows[batch_start : batch_start + effective_batch_size]
         batch_end = batch_start + len(batch)
         logger.info(
-            "Backtest progress: rows %d–%d / %d", batch_start + 1, batch_end, total
+            "Backtest progress: rows %d-%d / %d", batch_start + 1, batch_end, total
         )
 
         batch_tickers = [r["ticker"] for r in batch]
 
-        # --- Agent 1: batch extract fingerprints (3 vLLM call groups) ---
         try:
             fingerprints = extract_fingerprint_batch(
                 [r["article_text"] for r in batch],
@@ -139,7 +268,6 @@ def run_backtest(
             )
             fingerprints = [None] * len(batch)
 
-        # --- Strict mode: check event_type failures ---
         if FINGPT_BACKTEST_STRICT_MODE:
             for j, fp in enumerate(fingerprints):
                 if fp is not None and fp.event_type_method == "event_type_logits_failed":
@@ -149,7 +277,6 @@ def run_backtest(
                         batch_start + j + 1,
                     )
 
-        # --- Agent 2: batch generate signals (valid FPs only) ---
         valid_pairs: list[tuple[int, object]] = [
             (j, fp) for j, fp in enumerate(fingerprints) if fp is not None
         ]
@@ -167,11 +294,10 @@ def run_backtest(
             for k, j in enumerate(valid_indices):
                 batch_signals[j] = raw_signals[k]
 
-        # --- Per-row result assembly ---
         for j, row in enumerate(batch):
-            base_result = _make_base_result(row)
             fingerprint = fingerprints[j]
             signal = batch_signals[j]
+            base_result = flatten_article_result(row, fingerprint=fingerprint, signal=signal)
 
             try:
                 if fingerprint is None:
@@ -179,27 +305,6 @@ def run_backtest(
                     results.append(base_result)
                     continue
 
-                # Fill Agent 1 fields.
-                base_result["sentiment_label"] = fingerprint.sentiment_label
-                base_result["sentiment_confidence"] = fingerprint.sentiment_confidence
-                sp = fingerprint.sentiment_probabilities or {}
-                base_result["sentiment_prob_positive"] = sp.get("POSITIVE")
-                base_result["sentiment_prob_neutral"] = sp.get("NEUTRAL")
-                base_result["sentiment_prob_negative"] = sp.get("NEGATIVE")
-
-                base_result["event_type"] = fingerprint.event_type
-                base_result["event_type_confidence"] = fingerprint.event_type_confidence
-                base_result["event_type_margin"] = fingerprint.event_type_margin
-                base_result["event_type_method"] = fingerprint.event_type_method
-                base_result["event_type_probabilities"] = str(
-                    fingerprint.event_type_probabilities
-                ) if fingerprint.event_type_probabilities else None
-                base_result["secondary_event_type"] = fingerprint.secondary_event_type
-                base_result["secondary_event_type_confidence"] = (
-                    fingerprint.secondary_event_type_confidence
-                )
-
-                # Strict mode: skip if event_type_logits_failed.
                 if (
                     FINGPT_BACKTEST_STRICT_MODE
                     and fingerprint.event_type_method == "event_type_logits_failed"
@@ -212,16 +317,6 @@ def run_backtest(
                     base_result["skipped_reason"] = "signal_failed"
                     results.append(base_result)
                     continue
-
-                # Fill Agent 2 fields.
-                base_result["signal_direction"] = signal.direction
-                base_result["signal_confidence"] = signal.confidence
-                base_result["strategy_tag"] = signal.strategy_tag
-                base_result["signal_raw_logits"] = str(signal.raw_signal_logits)
-                base_result["signal_logits"] = str(signal.signal_logits)
-                base_result["signal_probabilities"] = str(signal.signal_probabilities)
-                base_result["signal_filter_forced_hold"] = signal.signal_filter_forced_hold
-                base_result["signal_filter_reason"] = signal.signal_filter_reason
 
                 realized_return = get_realized_return(
                     ticker=row["ticker"],
@@ -360,20 +455,18 @@ def compute_metrics(results: pd.DataFrame) -> dict:
     metrics["mean_strategy_return"] = mean_return
     metrics["std_strategy_return"] = std_return
     metrics["total_pnl"] = total_pnl
-    metrics["gross_return"] = total_pnl  # alias for clarity
+    metrics["gross_return"] = total_pnl
 
     if std_return > 0:
         metrics["annualized_sharpe"] = float((mean_return / std_return) * math.sqrt(52.0))
     else:
         metrics["annualized_sharpe"] = 0.0
 
-    # Max drawdown from cumulative return sequence.
     cum_returns = strategy_returns.cumsum()
     running_max = cum_returns.cummax()
     drawdowns = running_max - cum_returns
     metrics["max_drawdown"] = float(drawdowns.max()) if not drawdowns.empty else 0.0
 
-    # Alignment with FinGPT reference labels.
     if "fingpt_label" in successful.columns and "signal_direction" in successful.columns:
         successful_fgt = successful.copy()
         successful_fgt["fingpt_direction"] = successful_fgt["fingpt_label"].map(
@@ -385,14 +478,12 @@ def compute_metrics(results: pd.DataFrame) -> dict:
     else:
         metrics["vs_fingpt_accuracy"] = 0.0
 
-    # Signal filter forced-hold rate.
     if "signal_filter_forced_hold" in successful.columns:
         forced = successful["signal_filter_forced_hold"].astype(bool)
         metrics["signal_filter_forced_hold_rate"] = float(forced.mean())
     else:
         metrics["signal_filter_forced_hold_rate"] = 0.0
 
-    # Per-event_type grouped returns (if column present).
     if "event_type" in successful.columns:
         grouped = (
             successful.groupby("event_type")["strategy_return"]

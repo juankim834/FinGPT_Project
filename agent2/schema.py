@@ -37,6 +37,9 @@ class TradingSignal(BaseModel):
     # Raw logits before PMI correction — stored for diagnostics.
     raw_signal_logits: Optional[list[float]] = None
 
+    pmi_null_logprobs: Optional[list[float]] = None
+    pmi_alpha_used: Optional[float] = None
+
     # Calibrated probability vector, e.g. {"BUY": 0.72, "HOLD": 0.18, "SELL": 0.10}.
     signal_probabilities: Optional[dict[str, float]] = None
 

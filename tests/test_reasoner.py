@@ -389,6 +389,8 @@ class TestLogitsStorage:
         assert signal is not None
         assert signal.raw_signal_logits == raw
         assert signal.signal_logits == [2.0, 1.0, 1.0]  # raw - 1.0 * null
+        assert signal.pmi_null_logprobs == null
+        assert signal.pmi_alpha_used == 1.0
 
     def test_raw_equals_adjusted_when_alpha_zero(self):
         fp = _make_fingerprint()
@@ -398,3 +400,5 @@ class TestLogitsStorage:
         assert signal is not None
         assert signal.raw_signal_logits == raw
         assert signal.signal_logits == raw
+        assert signal.pmi_null_logprobs == null
+        assert signal.pmi_alpha_used == 0.0
