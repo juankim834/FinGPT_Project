@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import argparse
 
-from backtest.backtester import compute_metrics, run_backtest
+from backtest.backtester import compute_metrics, reprice_backtest_results, run_backtest
 
 
 def _print_metrics_table(metrics: dict) -> None:
@@ -40,7 +40,11 @@ def _print_metrics_table(metrics: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run FinGPT news-to-signal backtest.")
-    parser.add_argument("--dataset", required=True, help="Path to parquet/csv dataset file.")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Path to parquet/csv dataset file.",
+    )
     parser.add_argument(
         "--output",
         default="output/backtest_results.csv",
@@ -63,14 +67,33 @@ def main() -> None:
         default=None,
         help="Number of articles per vLLM batch. Overrides FINGPT_BACKTEST_BATCH_SIZE.",
     )
+    parser.add_argument(
+        "--resume-csv",
+        default=None,
+        help="Existing backtest CSV to re-price and re-score metrics without rerunning Agent 1/2.",
+    )
+    parser.add_argument(
+        "--no-refresh-prices",
+        action="store_true",
+        help="Reuse cached yfinance results when repricing an existing CSV.",
+    )
     args = parser.parse_args()
 
-    results = run_backtest(
-        dataset_path=args.dataset,
-        output_path=args.output,
-        max_rows=args.max_rows,
-        batch_size=args.batch_size,
-    )
+    if args.resume_csv:
+        results = reprice_backtest_results(
+            args.resume_csv,
+            output_path=args.output,
+            refresh_prices=not args.no_refresh_prices,
+        )
+    else:
+        if not args.dataset:
+            parser.error("--dataset is required unless --resume-csv is provided.")
+        results = run_backtest(
+            dataset_path=args.dataset,
+            output_path=args.output,
+            max_rows=args.max_rows,
+            batch_size=args.batch_size,
+        )
     if args.metrics:
         metrics = compute_metrics(results)
         _print_metrics_table(metrics)

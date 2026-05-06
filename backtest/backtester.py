@@ -14,7 +14,11 @@ import pandas as pd
 from agent1.extractor import extract_fingerprint_batch
 from agent2.reasoner import generate_signal_batch
 from backtest.dataset_parser import build_backtest_rows, load_dataset
-from backtest.price_fetcher import direction_from_return, get_realized_return
+from backtest.price_fetcher import (
+    direction_from_return,
+    get_realized_return,
+    get_realized_return_with_reason,
+)
 from config import (
     FINGPT_BACKTEST_BATCH_SIZE,
     FINGPT_BACKTEST_STRICT_MODE,
@@ -31,6 +35,20 @@ def _position_from_direction(direction: str) -> int:
     if direction == "short":
         return -1
     return 0
+
+
+def _normalize_optional_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    return str(value).strip()
+
+
+def _has_signal_for_pricing(row: pd.Series) -> bool:
+    signal_direction = _normalize_optional_text(row.get("signal_direction", ""))
+    direction = _normalize_optional_text(row.get("direction", ""))
+    return bool(signal_direction or direction)
 
 
 def _make_base_result(row: dict) -> dict:
@@ -97,6 +115,7 @@ def _make_base_result(row: dict) -> dict:
         "position": None,
         "strategy_return": None,
         "skipped_reason": "",
+        "price_fetch_error_reason": "",
     }
 
 
@@ -324,7 +343,7 @@ def run_backtest(
                     results.append(base_result)
                     continue
 
-                realized_return = get_realized_return(
+                realized_return, price_reason = get_realized_return_with_reason(
                     ticker=row["ticker"],
                     start_date=row["start_date"],
                     end_date=row["end_date"],
@@ -332,6 +351,7 @@ def run_backtest(
 
                 if realized_return is None:
                     base_result["skipped_reason"] = "price_fetch_failed"
+                    base_result["price_fetch_error_reason"] = price_reason
                     results.append(base_result)
                     continue
 
@@ -358,6 +378,76 @@ def run_backtest(
         os.makedirs(out_dir, exist_ok=True)
     results_df.to_csv(output_path, index=False)
     logger.info("Saved backtest results to %s", output_path)
+    return results_df
+
+
+def reprice_backtest_results(
+    results_or_path: pd.DataFrame | str,
+    output_path: Optional[str] = None,
+    *,
+    refresh_prices: bool = True,
+) -> pd.DataFrame:
+    """
+    Recompute realized returns for an existing backtest CSV/DataFrame.
+
+    This path is designed for recovery after transient yfinance failures. It
+    preserves Agent 1 / Agent 2 outputs and only re-runs the price layer.
+    """
+    if isinstance(results_or_path, pd.DataFrame):
+        results_df = results_or_path.copy()
+    else:
+        results_df = pd.read_csv(results_or_path)
+
+    if "price_fetch_error_reason" not in results_df.columns:
+        results_df["price_fetch_error_reason"] = ""
+
+    for idx in results_df.index:
+        row = results_df.loc[idx]
+
+        if not _has_signal_for_pricing(row):
+            continue
+
+        ticker = _normalize_optional_text(row.get("ticker", ""))
+        start_date = _normalize_optional_text(row.get("start_date", ""))
+        end_date = _normalize_optional_text(row.get("end_date", ""))
+        direction = _normalize_optional_text(
+            row.get("signal_direction", row.get("direction", ""))
+        )
+
+        realized_return, price_reason = get_realized_return_with_reason(
+            ticker=ticker,
+            start_date=start_date,
+            end_date=end_date,
+            refresh=refresh_prices,
+        )
+
+        if realized_return is None:
+            results_df.at[idx, "realized_return"] = None
+            results_df.at[idx, "position"] = None
+            results_df.at[idx, "strategy_return"] = None
+            results_df.at[idx, "price_fetch_error_reason"] = price_reason
+            if _normalize_optional_text(row.get("skipped_reason", "")) in {
+                "",
+                "price_fetch_failed",
+            }:
+                results_df.at[idx, "skipped_reason"] = "price_fetch_failed"
+            continue
+
+        position = _position_from_direction(direction)
+        results_df.at[idx, "realized_return"] = float(realized_return)
+        results_df.at[idx, "position"] = position
+        results_df.at[idx, "strategy_return"] = position * float(realized_return)
+        results_df.at[idx, "price_fetch_error_reason"] = ""
+        if _normalize_optional_text(row.get("skipped_reason", "")) == "price_fetch_failed":
+            results_df.at[idx, "skipped_reason"] = ""
+
+    if output_path:
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        results_df.to_csv(output_path, index=False)
+        logger.info("Saved repriced backtest results to %s", output_path)
+
     return results_df
 
 

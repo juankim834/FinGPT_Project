@@ -177,3 +177,25 @@ FINGPT_BACKTEST_STRICT_MODE: bool = _env_bool("FINGPT_BACKTEST_STRICT_MODE", Fal
 # Number of articles processed in a single batched vLLM call.
 # Overridable via CLI --batch-size.
 FINGPT_BACKTEST_BATCH_SIZE: int = int(os.getenv("FINGPT_BACKTEST_BATCH_SIZE", "10"))
+
+# ---------------------------------------------------------------------------
+# Backtest - price fetch
+# ---------------------------------------------------------------------------
+
+# Number of retries for yfinance price downloads.
+FINGPT_PRICE_FETCH_RETRIES: int = int(os.getenv("FINGPT_PRICE_FETCH_RETRIES", "2"))
+
+# Base delay (seconds) between yfinance retries.
+FINGPT_PRICE_FETCH_RETRY_BASE_DELAY_SEC: float = float(
+    os.getenv("FINGPT_PRICE_FETCH_RETRY_BASE_DELAY_SEC", "0.75")
+)
+
+# When False (default), failed price fetches are not persisted to disk cache.
+# This avoids "sticky" None caches poisoning later reruns after a transient
+# Yahoo/network issue.
+FINGPT_PRICE_CACHE_FAILURES: bool = _env_bool("FINGPT_PRICE_CACHE_FAILURES", False)
+
+# Writable directory for yfinance's internal timezone/cache database.
+FINGPT_YF_TZ_CACHE_DIR: str = os.getenv(
+    "FINGPT_YF_TZ_CACHE_DIR", os.path.join("output", "yfinance_tz_cache")
+)
