@@ -21,7 +21,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 FINGPT_MODEL_PATH: str = os.getenv("FINGPT_MODEL_PATH", "")
 FINGPT_ADAPTER_PATH: str = os.getenv("FINGPT_ADAPTER_PATH", "")
-SHARE_SINGLE_LLM_BETWEEN_AGENTS: bool = _env_bool("SHARE_SINGLE_LLM_BETWEEN_AGENTS", False)
+SHARE_SINGLE_LLM_BETWEEN_AGENTS: bool = _env_bool("SHARE_SINGLE_LLM_BETWEEN_AGENTS", True)
 
 # Generation settings for FinGPT fact extraction
 FINGPT_MAX_NEW_TOKENS: int = 1024
@@ -30,10 +30,10 @@ FINGPT_TEMPERATURE: float = 0.0   # deterministic extraction; no creative genera
 # ---------------------------------------------------------------------------
 # Anthropic (Agent 2) — Claude
 # ---------------------------------------------------------------------------
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL: str = "claude-sonnet-4-5"
-CLAUDE_MAX_TOKENS: int = 16_000   # must be > thinking budget
-CLAUDE_THINKING_BUDGET: int = 8_000
+# ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+# CLAUDE_MODEL: str = "claude-sonnet-4-5"
+# CLAUDE_MAX_TOKENS: int = 16_000   # must be > thinking budget
+# CLAUDE_THINKING_BUDGET: int = 8_000
 
 # ---------------------------------------------------------------------------
 # News API providers
