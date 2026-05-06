@@ -77,7 +77,7 @@ def test_load_or_fetch_alpaca_news_uses_cache_when_config_unchanged():
     assert loaded == articles
 
 
-def test_build_alpaca_backtest_dataset_groups_articles_by_week_and_marks_empty_windows():
+def test_build_alpaca_backtest_dataset_keeps_at_most_one_sample_per_symbol_week():
     case_dir = _make_case_dir()
     config_path = _write_config(case_dir)
     config = load_alpaca_backtest_config(config_path)
@@ -98,6 +98,14 @@ def test_build_alpaca_backtest_dataset_groups_articles_by_week_and_marks_empty_w
                     "summary": "second summary",
                     "content": "",
                     "created_at": "2024-01-04T14:30:00Z",
+                    "symbols": ["AAPL"],
+                },
+                {
+                    "id": 3,
+                    "headline": "Older article",
+                    "summary": "third summary",
+                    "content": "",
+                    "created_at": "2024-01-02T14:30:00Z",
                     "symbols": ["AAPL"],
                 },
             ],
@@ -123,6 +131,7 @@ def test_build_alpaca_backtest_dataset_groups_articles_by_week_and_marks_empty_w
     assert "Ticker: AAPL" in df.iloc[0]["input"]
     assert "[Headline]: AI launch" in df.iloc[0]["input"]
     assert "[Headline]: AI follow-up" in df.iloc[0]["input"]
+    assert "[Headline]: Older article" not in df.iloc[0]["input"]
     assert "abcdefghijkl" in df.iloc[0]["input"]
     assert "abcdefghijklm" not in df.iloc[0]["input"]
     assert df.iloc[0]["window_key"] == "2024-01-01__2024-01-07"

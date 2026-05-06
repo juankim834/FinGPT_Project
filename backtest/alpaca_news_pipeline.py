@@ -586,7 +586,7 @@ def build_alpaca_backtest_dataset(
     config: AlpacaBacktestConfig,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    chunk_size = config.combine_articles_per_sample
+    max_articles_per_sample = config.combine_articles_per_sample
 
     for symbol in config.symbols:
         symbol_windows = articles_by_symbol.get(symbol, {})
@@ -597,20 +597,21 @@ def build_alpaca_backtest_dataset(
                 rows.append(_skip_row_for_symbol(symbol, window_key))
                 continue
 
-            for idx in range(0, len(window_articles), chunk_size):
-                chunk = window_articles[idx : idx + chunk_size]
-                if not chunk:
-                    continue
-                rows.append(
-                    _articles_to_prompt(
-                        chunk,
-                        symbol,
-                        window_key,
-                        window_end,
-                        config.holding_period_days,
-                        config.content_max_chars,
-                    )
+            selected_articles = window_articles[:max_articles_per_sample]
+            if not selected_articles:
+                rows.append(_skip_row_for_symbol(symbol, window_key))
+                continue
+
+            rows.append(
+                _articles_to_prompt(
+                    selected_articles,
+                    symbol,
+                    window_key,
+                    window_end,
+                    config.holding_period_days,
+                    config.content_max_chars,
                 )
+            )
 
     return pd.DataFrame(
         rows,
