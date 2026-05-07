@@ -56,8 +56,16 @@ SYSTEM_PROMPT: str = EXTRACTION_PROMPT
 SENTIMENT_PROMPT: str = """\
 You are a financial news sentiment analyst.
 
-Read the following article and classify the market sentiment for investors.
 Use the article as the only source of truth.
+Do not judge the general market sentiment unless it directly affects the target asset.
+If the article mentions multiple companies or macro events, classify only the likely impact on the target asset.
+If the article is not relevant to the target asset, choose NEUTRAL.
+
+Sentiment labels:
+- POSITIVE: the news is likely favorable for the target asset.
+- NEUTRAL: the news is mixed, unclear, already non-directional, or not clearly relevant.
+- NEGATIVE: the news is likely unfavorable for the target asset.
+
 
 {article_text}\
 """

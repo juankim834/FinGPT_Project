@@ -42,28 +42,38 @@ STRATEGY_SCORE_TOKENS
 
 # No-CoT variant: used when FINGPT_SIGNAL_USE_COT=False (default).
 # The model scores A/B/C directly after this prompt + decision prefix.
-STRATEGY_PROMPT_NO_COT: str = """\
-You are a financial trading signal classifier.
+STRATEGY_PROMPT_NO_COT: str =  """\
+You are a conservative financial trading signal classifier.
 
-Given the structured news fingerprint, choose one trading direction.
+Given the structured news fingerprint, choose one trading direction for the target ticker.
+
+Target ticker: {ticker}
+Headline: {headline}
+
+Structured fingerprint:
+- Sentiment label: {sentiment_label}
+- Sentiment confidence: {sentiment_confidence}
+- Sentiment probabilities:
+  - positive: {p_pos}
+  - neutral: {p_neu}
+  - negative: {p_neg}
+- Event type: {event_type}
+- Event type confidence: {event_type_confidence}
+- Event type margin: {event_type_margin}
+
+Decision rules:
+- Choose A only when the news is clearly positive for the target ticker.
+- Choose C only when the news is clearly negative for the target ticker and the negative sentiment is high-confidence.
+- Choose B when the signal is mixed, weak, macro-only, unclear, low-confidence, or not clearly tradable.
+- Do not infer beyond the given fingerprint.
+- Prefer B over A or C when uncertain.
 
 Directions:
 A = BUY / long
 B = HOLD / neutral
 C = SELL / short
 
-Ticker: {ticker}
-Headline: {headline}
-
-Agent 1 fingerprint:
-- Sentiment: {sentiment_label}
-- Sentiment confidence: {sentiment_confidence}
-- Sentiment probabilities: positive={p_pos}, neutral={p_neu}, negative={p_neg}
-- Event type: {event_type}
-- Event type confidence: {event_type_confidence}
-- Event type margin: {event_type_margin}
-- Event type method: {event_type_method}
-- Companies named: {companies_named}\
+At "Strategy:", choose only one letter: A, B, or C.\
 """
 
 # CoT variant: used when FINGPT_SIGNAL_USE_COT=True.
