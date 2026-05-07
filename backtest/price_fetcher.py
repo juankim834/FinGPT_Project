@@ -168,11 +168,17 @@ def _fetch_yfinance_return(
     start_date: str,
     end_date: str,
 ) -> tuple[Optional[float], str]:
+    # Keep yfinance aligned with the Yahoo chart path by treating end_date as
+    # inclusive. yfinance's `end` parameter is exclusive, so we request the
+    # next calendar day.
+    end_exclusive = (
+        datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
     try:
         hist = yf.download(
             tickers=ticker,
             start=start_date,
-            end=end_date,
+            end=end_exclusive,
             interval="1d",
             auto_adjust=True,
             progress=False,
